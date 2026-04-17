@@ -1,4 +1,6 @@
-use std::{collections::HashMap, fmt, str::FromStr};
+mod crypto;
+
+use std::{collections::HashMap, fmt, str::FromStr, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
@@ -11,6 +13,9 @@ use iroh_gossip::{
     proto::TopicId,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+
+use crate::crypto::CryptoState;
 
 /// Chat over iroh-gossip
 ///
@@ -68,17 +73,19 @@ async fn main() -> Result<()> {
         let endpoints = vec![me];
         Ticket { topic, endpoints }
     };
-    println!("> ticket to join us: {ticket}");
+    println!("> ticket to join : {ticket}");
 
     let endpoint_ids = endpoints.iter().map(|p| p.id).collect();
     if endpoints.is_empty() {
-        println!("> waiting for endpoints to join us...");
+        println!("> waiting for endpoints to join ...");
     } else {
         println!("> trying to connect to {} endpoints...", endpoints.len());
     };
 
     let (sender, receiver) = gossip.subscribe_and_join(topic, endpoint_ids).await?.split();
     println!("> connected!");
+
+    let crypto = Arc::new(Mutex::new(CryptoState::new()));
 
     if let Some(name) = args.name {
         let message = Message::new(MessageBody::AboutMe {
@@ -88,18 +95,37 @@ async fn main() -> Result<()> {
         sender.broadcast(message.to_vec().into()).await?;
     }
 
-    tokio::spawn(subscribe_loop(receiver));
+    {
+        let cs = crypto.lock().await;
+        let message = Message::new(MessageBody::KeyExchange {
+            from: endpoint.id(),
+            public_key: cs.local_public.as_bytes().to_vec(),
+        });
+        sender.broadcast(message.to_vec().into()).await?;
+    }
+
+    tokio::spawn(subscribe_loop(receiver, Arc::clone(&crypto)));
 
     let (line_tx, mut line_rx) = tokio::sync::mpsc::channel(1);
     std::thread::spawn(move || input_loop(line_tx));
 
     println!("> type a message and hit enter to broadcast...");
     while let Some(text) = line_rx.recv().await {
-        let message = Message::new(MessageBody::Message {
-            from: endpoint.id(),
-            text: text.clone(),
-        });
-        sender.broadcast(message.to_vec().into()).await?;
+        let cs = crypto.lock().await;
+        if cs.is_ready() {
+            let encrypted = cs.encrypt(text.as_bytes());
+            let message = Message::new(MessageBody::Encrypted {
+                from: endpoint.id(),
+                data: encrypted,
+            });
+            sender.broadcast(message.to_vec().into()).await?;
+        } else {
+            let message = Message::new(MessageBody::Message {
+                from: endpoint.id(),
+                text: text.clone(),
+            });
+            sender.broadcast(message.to_vec().into()).await?;
+        }
         println!("> sent: {text}");
     }
     router.shutdown().await?;
@@ -116,7 +142,9 @@ struct Message {
 #[derive(Debug, Serialize, Deserialize)]
 enum MessageBody {
     AboutMe { from: EndpointId, name: String },
+    KeyExchange { from: EndpointId, public_key: Vec<u8> },
     Message { from: EndpointId, text: String },
+    Encrypted { from: EndpointId, data: Vec<u8> },
 }
 
 impl Message {
@@ -136,7 +164,7 @@ impl Message {
     }
 }
 
-async fn subscribe_loop(mut receiver: GossipReceiver) -> Result<()> {
+async fn subscribe_loop(mut receiver: GossipReceiver, crypto: Arc<Mutex<CryptoState>>) -> Result<()> {
     let mut names = HashMap::new();
     while let Some(event) = receiver.try_next().await? {
         if let Event::Received(msg) = event {
@@ -145,11 +173,42 @@ async fn subscribe_loop(mut receiver: GossipReceiver) -> Result<()> {
                     names.insert(from, name.clone());
                     println!("> {} is now known as {}", from.fmt_short(), name);
                 }
+                MessageBody::KeyExchange { from, public_key } => {
+                    if public_key.len() != 32 {
+                        println!("> received invalid public key from {}", from.fmt_short());
+                        continue;
+                    }
+                    let peer_public = x25519_dalek::PublicKey::from(
+                        <[u8; 32]>::try_from(&public_key[..]).unwrap(),
+                    );
+                    let mut cs = crypto.lock().await;
+                    if !cs.is_ready() {
+                        let code = cs.complete_handshake(&peer_public);
+                        println!("> key exchange complete with {}", from.fmt_short());
+                        println!("> SECURITY CODE: {code}");
+                        println!("> verify this code matches on the other device!");
+                    }
+                }
                 MessageBody::Message { from, text } => {
                     let name = names
                         .get(&from)
                         .map_or_else(|| from.fmt_short().to_string(), String::to_string);
-                    println!("{}: {}", name, text);
+                    println!("{name}: {text}");
+                }
+                MessageBody::Encrypted { from, data } => {
+                    let cs = crypto.lock().await;
+                    match cs.decrypt(&data) {
+                        Ok(plaintext) => {
+                            let text = String::from_utf8_lossy(&plaintext);
+                            let name = names
+                                .get(&from)
+                                .map_or_else(|| from.fmt_short().to_string(), String::to_string);
+                            println!("{name}: {text}");
+                        }
+                        Err(e) => {
+                            println!("> failed to decrypt message from {}: {e}", from.fmt_short());
+                        }
+                    }
                 }
             }
         }
