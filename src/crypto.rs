@@ -2,9 +2,10 @@ use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
 };
-use bip39::Language;
-use sha2::{Digest, Sha256};
+use serde_json::Value;
+use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
+use hkdf::Hkdf;
 
 pub struct CryptoState {
     secret: Option<EphemeralSecret>,
@@ -35,10 +36,20 @@ impl CryptoState {
 
         let shared: SharedSecret = secret.diffie_hellman(peer_public);
 
-        let key = Sha256::digest(shared.as_bytes());
-        let cipher = Aes256Gcm::new_from_slice(&key).expect("32-byte key");
+        // Protocol 4.2: Key Material Extraction
+        // Salt: b"patronus-protocol-v1"
+        let hk = Hkdf::<Sha256>::new(Some(b"patronus-protocol-v1"), shared.as_bytes());
+        
+        // K_enc (Encryption Key): b"session-encryption", 32 bytes
+        let mut okm_enc = [0u8; 32];
+        hk.expand(b"session-encryption", &mut okm_enc).expect("32 bytes");
+        let cipher = Aes256Gcm::new_from_slice(&okm_enc).expect("32-byte key");
 
-        let code = compute_security_code(&self.local_public, peer_public);
+        // K_id (Identity Key): b"identity-projection", 3 bytes
+        let mut okm_id = [0u8; 3];
+        hk.expand(b"identity-projection", &mut okm_id).expect("3 bytes");
+
+        let code = compute_security_code(&okm_id);
 
         self.session = Some(Session {
             cipher,
@@ -80,28 +91,29 @@ impl CryptoState {
     }
 }
 
-fn compute_security_code(a: &PublicKey, b: &PublicKey) -> String {
-    let wordlist = Language::English.word_list();
+fn compute_security_code(k_id: &[u8; 3]) -> String {
+    let wordlists_raw = include_str!("../assets/wordlists.json");
+    let wordlists: Value = serde_json::from_str(wordlists_raw).expect("valid json");
+    
+    let adjectives = wordlists["adjectives"].as_array().expect("adjectives array");
+    let colors = wordlists["colors"].as_array().expect("colors array");
+    let spirits = wordlists["spirits"].as_array().expect("spirits array");
 
-    let (first, second) = if a.as_bytes() < b.as_bytes() {
-        (a.as_bytes(), b.as_bytes())
-    } else {
-        (b.as_bytes(), a.as_bytes())
-    };
+    let w0 = adjectives[k_id[0] as usize].as_str().unwrap();
+    let w1 = colors[k_id[1] as usize].as_str().unwrap();
+    let w2 = spirits[k_id[2] as usize].as_str().unwrap();
 
-    let mut hasher = Sha256::new();
-    hasher.update(first);
-    hasher.update(second);
-    let hash = hasher.finalize();
-
-    (0..5)
-        .map(|i| {
-            let idx = u16::from_be_bytes([hash[i * 2], hash[i * 2 + 1]]) as usize % 2048;
-            wordlist[idx]
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    format!("{} {} {}", capitalize(w0), capitalize(w1), capitalize(w2))
 }
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

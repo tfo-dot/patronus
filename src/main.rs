@@ -1,136 +1,492 @@
 mod crypto;
+mod discovery;
 
-use std::{collections::HashMap, fmt, str::FromStr, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;
+use discovery::DiscoveryService;
 use futures_lite::StreamExt;
-use iroh::{protocol::Router, Endpoint, EndpointAddr, EndpointId};
-use iroh::endpoint::presets;
-use iroh_gossip::{
-    api::{GossipReceiver, Event},
-    net::Gossip,
-    proto::TopicId,
-};
+use iroh::{Endpoint, EndpointId, endpoint::presets, protocol::Router};
+use iroh_gossip::{TopicId, api::Event, net::Gossip};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use ssh_key::PrivateKey;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::crypto::CryptoState;
+use ratatui::{
+    DefaultTerminal, Frame,
+    crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind},
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+};
 
-/// Chat over iroh-gossip
-///
-/// This broadcasts unsigned messages over iroh-gossip.
-///
-/// By default a new endpoint id is created when starting the example.
-///
-/// By default, we use the default n0 discovery services to dial by `EndpointId`.
 #[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
 struct Args {
-    #[clap(short, long)]
+    #[arg(short, long)]
     name: Option<String>,
-    #[clap(short, long, default_value = "0")]
-    bind_port: u16,
-    #[clap(subcommand)]
-    command: Command,
+    #[arg(short, long)]
+    priv_key: Option<String>,
 }
 
-#[derive(Parser, Debug)]
-enum Command {
-    Open,
-    Join {
-        ticket: String,
+#[derive(Debug, Clone)]
+enum UiEvent {
+    Message {
+        from: String,
+        text: String,
+        is_system: bool,
     },
+    HandshakeComplete(String),
+    LocalInfo {
+        node_id: String,
+    },
+    PeerUpdate {
+        id: EndpointId,
+        name: String,
+    },
+    PeerLeft {
+        id: EndpointId,
+    },
+}
+
+struct App {
+    messages: Vec<(String, String, bool)>, // (Sender, Content, IsSystem)
+    peers: HashMap<EndpointId, String>,
+    local_node_id: String,
+    identity_phrase: Option<String>,
+    input: String,
+}
+
+impl App {
+    fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            peers: HashMap::new(),
+            local_node_id: "Initializing...".to_string(),
+            identity_phrase: None,
+            input: String::new(),
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let name = args.name.unwrap_or_else(|| "Anonymous".to_string());
 
-    let (topic, endpoints) = match &args.command {
-        Command::Open => {
-            let topic = TopicId::from_bytes(rand::random());
-            println!("> opening chat room for topic {topic}");
-            (topic, vec![])
+    let pk = match args.priv_key {
+        Some(p) => PrivateKey::read_openssh_file(Path::new(&p)),
+        None => {
+            //Source: `keys/one`
+            PrivateKey::from_openssh(
+                r#"-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACDdIGzOO9EekDQsuUq+NwQhgMkxFtucMv3ZfSBEaZZ0KwAAAJjeTmNM3k5j
+TAAAAAtzc2gtZWQyNTUxOQAAACDdIGzOO9EekDQsuUq+NwQhgMkxFtucMv3ZfSBEaZZ0Kw
+AAAED7wCW1EnAbrv1eo8S5ltXItDwrhriZKtEYLdSK1OUjJd0gbM470R6QNCy5Sr43BCGA
+yTEW25wy/dl9IERplnQrAAAAD3Rmb0B3YXJyb3Zlci1ycAECAwQFBg==
+-----END OPENSSH PRIVATE KEY-----"#,
+            )
         }
-        Command::Join { ticket } => {
-            let Ticket { topic, endpoints } = Ticket::from_str(ticket)?;
-            println!("> joining chat room for topic {topic}");
-            (topic, endpoints)
+    }
+    .unwrap();
+
+    let res = pk.public_key().fingerprint(ssh_key::HashAlg::Sha256);
+
+    let crypto = Arc::new(Mutex::new(CryptoState::new()));
+    let closed = Arc::new(Mutex::new(false));
+    let app = App::new();
+
+    let (ui_tx, ui_rx) = mpsc::channel(100);
+    let (msg_tx, mut msg_rx) = mpsc::channel::<String>(100);
+
+    let crypto_iroh = crypto.clone();
+    let ui_tx_iroh = ui_tx.clone();
+    let is_closed = closed.clone();
+    tokio::spawn(async move {
+        let iroh_tx = ui_tx_iroh.clone();
+        let error_tx = ui_tx_iroh.clone();
+
+        if let Err(e) = run_iroh(name, crypto_iroh, iroh_tx, &mut msg_rx, is_closed).await {
+            let _ = error_tx
+                .send(UiEvent::Message {
+                    from: "Error".to_string(),
+                    text: format!("Iroh error: {}", e),
+                    is_system: true,
+                })
+                .await;
         }
-    };
+    });
 
-    let endpoint = Endpoint::bind(presets::N0).await?;
+    let app_port: u16 = (rand::random::<u16>() % 255) + 6000;
+    let discovery = Arc::new(DiscoveryService::new(app_port, res.to_string()));
 
-    println!("> our endpoint id: {}", endpoint.id());
+    let discovery_clone = discovery.clone();
+    tokio::spawn(async move {
+        discovery_clone.start();
+    });
+
+    // UI loop
+    let mut terminal = ratatui::init();
+    let result = run_app(&mut terminal, app, ui_rx, msg_tx).await;
+
+    ratatui::restore();
+
+    discovery.stop();
+    *closed.lock().await = true;
+
+    result
+}
+
+async fn run_iroh(
+    name: String,
+    crypto: Arc<Mutex<CryptoState>>,
+    ui_tx: mpsc::Sender<UiEvent>,
+    msg_rx: &mut mpsc::Receiver<String>,
+    closed: Arc<Mutex<bool>>,
+) -> Result<()> {
+    let endpoint = Endpoint::builder(presets::N0).bind().await?;
+
     let gossip = Gossip::builder().spawn(endpoint.clone());
 
-    let router = Router::builder(endpoint.clone())
+    let _router = Router::builder(endpoint.clone())
         .accept(iroh_gossip::ALPN, gossip.clone())
         .spawn();
 
-    let ticket = {
-        let me = endpoint.addr();
-        let endpoints = vec![me];
-        Ticket { topic, endpoints }
-    };
-    println!("> ticket to join : {ticket}");
+    let node_id = endpoint.id();
+    ui_tx
+        .send(UiEvent::LocalInfo {
+            node_id: node_id.to_string(),
+        })
+        .await?;
 
-    let endpoint_ids = endpoints.iter().map(|p| p.id).collect();
-    if endpoints.is_empty() {
-        println!("> waiting for endpoints to join ...");
-    } else {
-        println!("> trying to connect to {} endpoints...", endpoints.len());
-    };
+    ui_tx
+        .send(UiEvent::Message {
+            from: "System".to_string(),
+            text: format!("Welcome to Patronus. Your NodeID is {}", node_id),
+            is_system: true,
+        })
+        .await?;
 
-    let (sender, receiver) = gossip.subscribe_and_join(topic, endpoint_ids).await?.split();
-    println!("> connected!");
+    let topic_id = TopicId::from([0u8; 32]);
+    let topic = gossip.subscribe_and_join(topic_id, vec![]).await?;
+    let (gossip_tx, mut gossip_rx) = topic.split();
 
-    let crypto = Arc::new(Mutex::new(CryptoState::new()));
+    let crypto_c = crypto.clone();
+    let ui_tx_c = ui_tx.clone();
+    let endpoint_c = endpoint.clone();
+    let name_c = name.clone();
+    let gossip_tx_r = gossip_tx.clone();
 
-    if let Some(name) = args.name {
-        let message = Message::new(MessageBody::AboutMe {
-            from: endpoint.id(),
-            name,
+    // Gossip receiver task
+    tokio::spawn(async move {
+        let mut peer_names: HashMap<EndpointId, String> = HashMap::new();
+
+        // Broadcast our name periodically or at start
+        let intro = Message::new(MessageBody::AboutMe {
+            from: endpoint_c.id(),
+            name: name_c.clone(),
         });
-        sender.broadcast(message.to_vec().into()).await?;
-    }
+        let _ = gossip_tx_r.broadcast(intro.to_vec().into()).await;
 
-    {
-        let cs = crypto.lock().await;
-        let message = Message::new(MessageBody::KeyExchange {
-            from: endpoint.id(),
-            public_key: cs.local_public.as_bytes().to_vec(),
+        // Broadcast our public key for handshake
+        let pk = crypto_c.lock().await.local_public;
+        let kex = Message::new(MessageBody::KeyExchange {
+            from: endpoint_c.id(),
+            public_key: pk.as_bytes().to_vec(),
         });
-        sender.broadcast(message.to_vec().into()).await?;
-    }
+        let _ = gossip_tx_r.broadcast(kex.to_vec().into()).await;
 
-    tokio::spawn(subscribe_loop(receiver, Arc::clone(&crypto)));
-
-    let (line_tx, mut line_rx) = tokio::sync::mpsc::channel(1);
-    std::thread::spawn(move || input_loop(line_tx));
-
-    println!("> type a message and hit enter to broadcast...");
-    while let Some(text) = line_rx.recv().await {
-        let cs = crypto.lock().await;
-        if cs.is_ready() {
-            let encrypted = cs.encrypt(text.as_bytes());
-            let message = Message::new(MessageBody::Encrypted {
-                from: endpoint.id(),
-                data: encrypted,
-            });
-            sender.broadcast(message.to_vec().into()).await?;
-        } else {
-            let message = Message::new(MessageBody::Message {
-                from: endpoint.id(),
-                text: text.clone(),
-            });
-            sender.broadcast(message.to_vec().into()).await?;
+        while let Some(Ok(event)) = gossip_rx.next().await {
+            match event {
+                Event::Received(msg) => {
+                    if let Ok(m) = Message::from_bytes(&msg.content) {
+                        match m.body {
+                            MessageBody::AboutMe { from, name } => {
+                                peer_names.insert(from, name.clone());
+                                let _ = ui_tx_c
+                                    .send(UiEvent::PeerUpdate {
+                                        id: from,
+                                        name: name.clone(),
+                                    })
+                                    .await;
+                                let _ = ui_tx_c
+                                    .send(UiEvent::Message {
+                                        from: "System".to_string(),
+                                        text: format!(
+                                            "{} is now known as {}",
+                                            from.fmt_short(),
+                                            name
+                                        ),
+                                        is_system: true,
+                                    })
+                                    .await;
+                            }
+                            MessageBody::KeyExchange {
+                                from: _,
+                                public_key,
+                            } => {
+                                if public_key.len() == 32 {
+                                    let peer_public = x25519_dalek::PublicKey::from(
+                                        <[u8; 32]>::try_from(&public_key[..]).unwrap(),
+                                    );
+                                    let mut cs = crypto_c.lock().await;
+                                    if !cs.is_ready() {
+                                        let code = cs.complete_handshake(&peer_public);
+                                        let _ =
+                                            ui_tx_c.send(UiEvent::HandshakeComplete(code)).await;
+                                    }
+                                }
+                            }
+                            MessageBody::Message { from, text } => {
+                                let name = peer_names
+                                    .get(&from)
+                                    .cloned()
+                                    .unwrap_or_else(|| from.fmt_short().to_string());
+                                let _ = ui_tx_c
+                                    .send(UiEvent::Message {
+                                        from: name,
+                                        text,
+                                        is_system: false,
+                                    })
+                                    .await;
+                            }
+                            MessageBody::Encrypted { from, data } => {
+                                let cs = crypto_c.lock().await;
+                                if let Ok(plaintext) = cs.decrypt(&data) {
+                                    let text = String::from_utf8_lossy(&plaintext).to_string();
+                                    let name = peer_names
+                                        .get(&from)
+                                        .cloned()
+                                        .unwrap_or_else(|| from.fmt_short().to_string());
+                                    let _ = ui_tx_c
+                                        .send(UiEvent::Message {
+                                            from: name,
+                                            text,
+                                            is_system: false,
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                Event::NeighborUp(peer) => {
+                    let _ = ui_tx_c
+                        .send(UiEvent::Message {
+                            from: "System".to_string(),
+                            text: format!("Neighbor {} up", peer.fmt_short()),
+                            is_system: true,
+                        })
+                        .await;
+                    // Send them our info
+                    let intro = Message::new(MessageBody::AboutMe {
+                        from: endpoint_c.id(),
+                        name: name_c.clone(),
+                    });
+                    let _ = gossip_tx_r.broadcast(intro.to_vec().into()).await;
+                }
+                Event::NeighborDown(peer) => {
+                    let _ = ui_tx_c.send(UiEvent::PeerLeft { id: peer }).await;
+                    let _ = ui_tx_c
+                        .send(UiEvent::Message {
+                            from: "System".to_string(),
+                            text: format!("Neighbor {} down", peer.fmt_short()),
+                            is_system: true,
+                        })
+                        .await;
+                }
+                _ => {}
+            }
         }
-        println!("> sent: {text}");
+    });
+
+    // Sender task
+    let gossip_tx_s = gossip_tx.clone();
+    let endpoint_s = endpoint.clone();
+    let crypto_s = crypto.clone();
+
+    while *closed.lock().await == false
+        && let Some(text) = msg_rx.recv().await
+    {
+        let cs = crypto_s.lock().await;
+        let msg = if cs.is_ready() {
+            Message::new(MessageBody::Encrypted {
+                from: endpoint_s.id(),
+                data: cs.encrypt(text.as_bytes()),
+            })
+        } else {
+            Message::new(MessageBody::Message {
+                from: endpoint_s.id(),
+                text,
+            })
+        };
+        let _ = gossip_tx_s.broadcast(msg.to_vec().into()).await;
     }
-    router.shutdown().await?;
 
     Ok(())
+}
+
+async fn run_app(
+    terminal: &mut DefaultTerminal,
+    mut app: App,
+    mut ui_rx: mpsc::Receiver<UiEvent>,
+    msg_tx: mpsc::Sender<String>,
+) -> Result<()> {
+    loop {
+        terminal.draw(|f| render(f, &app))?;
+
+        if event::poll(Duration::from_millis(10))? {
+            if let CrosstermEvent::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Enter => {
+                            if !app.input.is_empty() {
+                                let input = app.input.drain(..).collect::<String>();
+                                if msg_tx.try_send(input.clone()).is_ok() {
+                                    app.messages.push(("Me".to_string(), input, false));
+                                }
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            app.input.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            app.input.pop();
+                        }
+                        KeyCode::Esc => {
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        while let Ok(event) = ui_rx.try_recv() {
+            match event {
+                UiEvent::Message {
+                    from,
+                    text,
+                    is_system,
+                } => {
+                    app.messages.push((from, text, is_system));
+                }
+                UiEvent::HandshakeComplete(code) => {
+                    app.identity_phrase = Some(code);
+                }
+                UiEvent::LocalInfo { node_id } => {
+                    app.local_node_id = node_id;
+                }
+                UiEvent::PeerUpdate { id, name } => {
+                    app.peers.insert(id, name);
+                }
+                UiEvent::PeerLeft { id } => {
+                    app.peers.remove(&id);
+                }
+            }
+        }
+    }
+}
+
+fn render(f: &mut Frame, app: &App) {
+    let main_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Info bar
+            Constraint::Min(0),    // Middle part (Peers + Chat)
+            Constraint::Length(3), // Input
+        ])
+        .split(f.area());
+
+    // Info Bar
+    let identity = app
+        .identity_phrase
+        .as_deref()
+        .unwrap_or("Waiting for handshake...");
+    let info_text = vec![Line::from(vec![
+        Span::styled("NodeID: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(&app.local_node_id),
+        Span::raw(" | "),
+        Span::styled("Identity: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(identity, Style::default().fg(Color::Cyan)),
+    ])];
+    let info = Paragraph::new(info_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Patronus Status"),
+    );
+    f.render_widget(info, main_layout[0]);
+
+    // Middle Layout (Peers sidebar + Chat)
+    let middle_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(25), // Peers
+            Constraint::Percentage(75), // Chat
+        ])
+        .split(main_layout[1]);
+
+    // Peers List
+    let mut peers_data: Vec<_> = app.peers.iter().collect();
+    peers_data.sort_by(|a, b| a.1.cmp(b.1));
+
+    let peers: Vec<ListItem> = peers_data
+        .into_iter()
+        .map(|(id, name)| {
+            ListItem::new(Line::from(vec![
+                Span::styled(name, Style::default().fg(Color::Yellow)),
+                Span::raw(" ("),
+                Span::styled(
+                    id.fmt_short().to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(")"),
+            ]))
+        })
+        .collect();
+
+    let peers_list = List::new(peers).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Nearby Devices"),
+    );
+    f.render_widget(peers_list, middle_layout[0]);
+
+    // Chat
+    let messages: Vec<ListItem> = app
+        .messages
+        .iter()
+        .map(|(from, content, is_system)| {
+            let style = if *is_system {
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC)
+            } else if from == "Me" {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
+
+            let header = Span::styled(format!("{}: ", from), style.add_modifier(Modifier::BOLD));
+            let body = Span::raw(content);
+            ListItem::new(Line::from(vec![header, body]))
+        })
+        .collect();
+
+    let chat = List::new(messages).block(Block::default().borders(Borders::ALL).title("Chat"));
+    f.render_widget(chat, middle_layout[1]);
+
+    // Input
+    let input = Paragraph::new(app.input.as_str()).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Message (Esc to quit)"),
+    );
+    f.render_widget(input, main_layout[2]);
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -141,10 +497,22 @@ struct Message {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum MessageBody {
-    AboutMe { from: EndpointId, name: String },
-    KeyExchange { from: EndpointId, public_key: Vec<u8> },
-    Message { from: EndpointId, text: String },
-    Encrypted { from: EndpointId, data: Vec<u8> },
+    AboutMe {
+        from: EndpointId,
+        name: String,
+    },
+    KeyExchange {
+        from: EndpointId,
+        public_key: Vec<u8>,
+    },
+    Message {
+        from: EndpointId,
+        text: String,
+    },
+    Encrypted {
+        from: EndpointId,
+        data: Vec<u8>,
+    },
 }
 
 impl Message {
@@ -161,99 +529,5 @@ impl Message {
 
     pub fn to_vec(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("serde_json::to_vec is infallible")
-    }
-}
-
-async fn subscribe_loop(mut receiver: GossipReceiver, crypto: Arc<Mutex<CryptoState>>) -> Result<()> {
-    let mut names = HashMap::new();
-    while let Some(event) = receiver.try_next().await? {
-        if let Event::Received(msg) = event {
-            match Message::from_bytes(&msg.content)?.body {
-                MessageBody::AboutMe { from, name } => {
-                    names.insert(from, name.clone());
-                    println!("> {} is now known as {}", from.fmt_short(), name);
-                }
-                MessageBody::KeyExchange { from, public_key } => {
-                    if public_key.len() != 32 {
-                        println!("> received invalid public key from {}", from.fmt_short());
-                        continue;
-                    }
-                    let peer_public = x25519_dalek::PublicKey::from(
-                        <[u8; 32]>::try_from(&public_key[..]).unwrap(),
-                    );
-                    let mut cs = crypto.lock().await;
-                    if !cs.is_ready() {
-                        let code = cs.complete_handshake(&peer_public);
-                        println!("> key exchange complete with {}", from.fmt_short());
-                        println!("> SECURITY CODE: {code}");
-                        println!("> verify this code matches on the other device!");
-                    }
-                }
-                MessageBody::Message { from, text } => {
-                    let name = names
-                        .get(&from)
-                        .map_or_else(|| from.fmt_short().to_string(), String::to_string);
-                    println!("{name}: {text}");
-                }
-                MessageBody::Encrypted { from, data } => {
-                    let cs = crypto.lock().await;
-                    match cs.decrypt(&data) {
-                        Ok(plaintext) => {
-                            let text = String::from_utf8_lossy(&plaintext);
-                            let name = names
-                                .get(&from)
-                                .map_or_else(|| from.fmt_short().to_string(), String::to_string);
-                            println!("{name}: {text}");
-                        }
-                        Err(e) => {
-                            println!("> failed to decrypt message from {}: {e}", from.fmt_short());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn input_loop(line_tx: tokio::sync::mpsc::Sender<String>) -> Result<()> {
-    let mut buffer = String::new();
-    let stdin = std::io::stdin();
-    loop {
-        stdin.read_line(&mut buffer)?;
-        line_tx.blocking_send(buffer.clone())?;
-        buffer.clear();
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Ticket {
-    topic: TopicId,
-    endpoints: Vec<EndpointAddr>,
-}
-
-impl Ticket {
-    fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes).map_err(Into::into)
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("serde_json::to_vec is infallible")
-    }
-}
-
-impl fmt::Display for Ticket {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut text = data_encoding::BASE32_NOPAD.encode(&self.to_bytes()[..]);
-        text.make_ascii_lowercase();
-        write!(f, "{}", text)
-    }
-}
-
-impl FromStr for Ticket {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bytes = data_encoding::BASE32_NOPAD.decode(s.to_ascii_uppercase().as_bytes())?;
-        Self::from_bytes(&bytes)
     }
 }
