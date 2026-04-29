@@ -1,3 +1,4 @@
+mod client;
 mod crypto;
 mod discovery;
 
@@ -6,14 +7,12 @@ use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use anyhow::Result;
 use clap::Parser;
 use discovery::DiscoveryService;
-use futures_lite::StreamExt;
-use iroh::{Endpoint, EndpointId, endpoint::presets, protocol::Router};
-use iroh_gossip::{TopicId, api::Event, net::Gossip};
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
-use ssh_key::PrivateKey;
+use ssh_key::{HashAlg, PrivateKey};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::crypto::{CryptoState, node_id_from, sign_ephemeral};
+use crate::crypto::CryptoState;
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers},
@@ -47,9 +46,6 @@ enum UiEvent {
         id: String,
         name: String,
     },
-    PeerLeft {
-        id: String,
-    },
 }
 
 struct App {
@@ -77,61 +73,31 @@ impl App {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let name = args.name.unwrap_or_else(|| "Anonymous".to_string());
+    let _name = args.name.unwrap_or_else(|| "Anonymous".to_string());
 
     let pk = match args.priv_key {
         Some(p) => PrivateKey::read_openssh_file(Path::new(&p)),
-        None => {
-            //Source: `keys/one`
-            PrivateKey::from_openssh(
-                r#"-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
-QyNTUxOQAAACDdIGzOO9EekDQsuUq+NwQhgMkxFtucMv3ZfSBEaZZ0KwAAAJjeTmNM3k5j
-TAAAAAtzc2gtZWQyNTUxOQAAACDdIGzOO9EekDQsuUq+NwQhgMkxFtucMv3ZfSBEaZZ0Kw
-AAAED7wCW1EnAbrv1eo8S5ltXItDwrhriZKtEYLdSK1OUjJd0gbM470R6QNCy5Sr43BCGA
-yTEW25wy/dl9IERplnQrAAAAD3Rmb0B3YXJyb3Zlci1ycAECAwQFBg==
------END OPENSSH PRIVATE KEY-----"#,
-            )
-        }
+        None => PrivateKey::from_openssh(include_str!("../keys/one")),
     }
-        .unwrap();
+    .unwrap();
 
-    // Extract ed25519 seed for handshake signatures
-    let signing_key = {
-        let kp = pk.key_data().ed25519().expect("ed25519 key");
-        let seed: [u8; 32] = kp.private.as_ref()[..32].try_into().unwrap();
-        ed25519_dalek::SigningKey::from_bytes(&seed)
-    };
+    let binding = pk.public_key().fingerprint(HashAlg::Sha256).to_string();
+    let local_node_id = binding.strip_prefix("SHA256:").unwrap();
 
-    let local_node_id = node_id_from(signing_key.verifying_key().as_bytes());
 
-    let crypto = Arc::new(Mutex::new(CryptoState::new()));
+
+    let ed_sk = pk.key_data().ed25519().expect("Ed25519 key required");
+    let signing_key = SigningKey::from_bytes(ed_sk.private.as_ref());
+
+    let _crypto = Arc::new(Mutex::new(CryptoState::new(signing_key)));
     let closed = Arc::new(Mutex::new(false));
     let app = App::new();
 
     let (ui_tx, ui_rx) = mpsc::channel(100);
-    let (msg_tx, mut msg_rx) = mpsc::channel::<String>(100);
-
-    let crypto_iroh = crypto.clone();
-    let ui_tx_iroh = ui_tx.clone();
-    let is_closed = closed.clone();
-    tokio::spawn(async move {
-        let iroh_tx = ui_tx_iroh.clone();
-        let error_tx = ui_tx_iroh.clone();
-
-        if let Err(e) = run_iroh(name, crypto_iroh, iroh_tx, &mut msg_rx, is_closed, signing_key).await {
-            let _ = error_tx
-                .send(UiEvent::Message {
-                    from: "Error".to_string(),
-                    text: format!("Iroh error: {}", e),
-                    is_system: true,
-                })
-                .await;
-        }
-    });
+    let (msg_tx, _msg_rx) = mpsc::channel::<String>(100);
 
     let app_port: u16 = (rand::random::<u16>() % 255) + 6000;
-    let discovery = Arc::new(DiscoveryService::new(app_port, local_node_id.clone()));
+    let discovery = Arc::new(DiscoveryService::new(app_port, local_node_id.to_string()));
 
     let ui_tx_disc = ui_tx.clone();
 
@@ -147,226 +113,6 @@ yTEW25wy/dl9IERplnQrAAAAD3Rmb0B3YXJyb3Zlci1ycAECAwQFBg==
     *closed.lock().await = true;
 
     result
-}
-
-async fn run_iroh(
-    name: String,
-    crypto: Arc<Mutex<CryptoState>>,
-    ui_tx: mpsc::Sender<UiEvent>,
-    msg_rx: &mut mpsc::Receiver<String>,
-    closed: Arc<Mutex<bool>>,
-    signing_key: ed25519_dalek::SigningKey,
-) -> Result<()> {
-    let endpoint = Endpoint::builder(presets::N0).bind().await?;
-
-    let gossip = Gossip::builder().spawn(endpoint.clone());
-
-    let _router = Router::builder(endpoint.clone())
-        .accept(iroh_gossip::ALPN, gossip.clone())
-        .spawn();
-
-    let local_node_id = node_id_from(signing_key.verifying_key().as_bytes());
-    ui_tx
-        .send(UiEvent::LocalInfo {
-            node_id: local_node_id.clone(),
-        })
-        .await?;
-
-    ui_tx
-        .send(UiEvent::Message {
-            from: "System".to_string(),
-            text: format!("Welcome to Patronus. Your NodeID is {}", local_node_id),
-            is_system: true,
-        })
-        .await?;
-
-    let topic_id = TopicId::from([0u8; 32]);
-    let topic = gossip.subscribe_and_join(topic_id, vec![]).await?;
-    let (gossip_tx, mut gossip_rx) = topic.split();
-
-    let crypto_c = crypto.clone();
-    let ui_tx_c = ui_tx.clone();
-    let endpoint_c = endpoint.clone();
-    let name_c = name.clone();
-    let gossip_tx_r = gossip_tx.clone();
-    let topic_bytes = *topic_id.as_bytes();
-
-    // Sign our ephemeral key before spawning (§4.1)
-    let ephemeral_pk = crypto_c.lock().await.local_public;
-    let handshake_sig = sign_ephemeral(&ephemeral_pk, &signing_key);
-    let static_pk_bytes = signing_key.verifying_key().to_bytes().to_vec();
-
-    // Gossip receiver task
-    tokio::spawn(async move {
-        let mut peer_names: HashMap<EndpointId, String> = HashMap::new();
-
-        // Broadcast our name periodically or at start
-        let intro = Message::new(MessageBody::AboutMe {
-            from: endpoint_c.id(),
-            name: name_c.clone(),
-        });
-        let _ = gossip_tx_r.broadcast(intro.to_vec().into()).await;
-
-        // Broadcast our public key + signature for handshake
-        let kex = Message::new(MessageBody::KeyExchange {
-            from: endpoint_c.id(),
-            public_key: ephemeral_pk.as_bytes().to_vec(),
-            static_public_key: static_pk_bytes.clone(),
-            signature: handshake_sig.clone(),
-        });
-        let _ = gossip_tx_r.broadcast(kex.to_vec().into()).await;
-
-        while let Some(Ok(event)) = gossip_rx.next().await {
-            match event {
-                Event::Received(msg) => {
-                    if let Ok(m) = Message::from_bytes(&msg.content) {
-                        match m.body {
-                            MessageBody::AboutMe { from, name } => {
-                                peer_names.insert(from, name.clone());
-                                let _ = ui_tx_c
-                                    .send(UiEvent::PeerUpdate {
-                                        id: from.to_string(),
-                                        name: name.clone(),
-                                    })
-                                    .await;
-                                let _ = ui_tx_c
-                                    .send(UiEvent::Message {
-                                        from: "System".to_string(),
-                                        text: format!(
-                                            "{} is now known as {}",
-                                            from.fmt_short(),
-                                            name
-                                        ),
-                                        is_system: true,
-                                    })
-                                    .await;
-                            }
-                            MessageBody::KeyExchange {
-                                from,
-                                public_key,
-                                static_public_key,
-                                signature,
-                            } => {
-                                if public_key.len() == 32 && static_public_key.len() == 32 {
-                                    let peer_public = x25519_dalek::PublicKey::from(
-                                        <[u8; 32]>::try_from(&public_key[..]).unwrap(),
-                                    );
-                                    let spk: [u8; 32] = static_public_key.try_into().unwrap();
-                                    let mut cs = crypto_c.lock().await;
-                                    if !cs.is_ready() {
-                                        match cs.complete_handshake(&peer_public, &spk, &signature) {
-                                            Ok(code) => {
-                                                let _ = ui_tx_c
-                                                    .send(UiEvent::HandshakeComplete(code))
-                                                    .await;
-                                            }
-                                            Err(e) => {
-                                                let _ = ui_tx_c
-                                                    .send(UiEvent::Message {
-                                                        from: "System".to_string(),
-                                                        text: format!(
-                                                            "Handshake with {} failed: {e}",
-                                                            from.fmt_short()
-                                                        ),
-                                                        is_system: true,
-                                                    })
-                                                    .await;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            MessageBody::Message { from, text } => {
-                                let name = peer_names
-                                    .get(&from)
-                                    .cloned()
-                                    .unwrap_or_else(|| from.fmt_short().to_string());
-                                let _ = ui_tx_c
-                                    .send(UiEvent::Message {
-                                        from: name,
-                                        text,
-                                        is_system: false,
-                                    })
-                                    .await;
-                            }
-                            MessageBody::Encrypted { from, data } => {
-                                let cs = crypto_c.lock().await;
-                                if let Ok(plaintext) = cs.decrypt(&data, &topic_bytes) {
-                                    let text = String::from_utf8_lossy(&plaintext).to_string();
-                                    let name = peer_names
-                                        .get(&from)
-                                        .cloned()
-                                        .unwrap_or_else(|| from.fmt_short().to_string());
-                                    let _ = ui_tx_c
-                                        .send(UiEvent::Message {
-                                            from: name,
-                                            text,
-                                            is_system: false,
-                                        })
-                                        .await;
-                                }
-                            }
-                        }
-                    }
-                }
-                Event::NeighborUp(peer) => {
-                    let _ = ui_tx_c
-                        .send(UiEvent::Message {
-                            from: "System".to_string(),
-                            text: format!("Neighbor {} up", peer.fmt_short()),
-                            is_system: true,
-                        })
-                        .await;
-                    // Send them our info
-                    let intro = Message::new(MessageBody::AboutMe {
-                        from: endpoint_c.id(),
-                        name: name_c.clone(),
-                    });
-                    let _ = gossip_tx_r.broadcast(intro.to_vec().into()).await;
-                }
-                Event::NeighborDown(peer) => {
-                    let _ = ui_tx_c
-                        .send(UiEvent::PeerLeft {
-                            id: peer.to_string(),
-                        })
-                        .await;
-                    let _ = ui_tx_c
-                        .send(UiEvent::Message {
-                            from: "System".to_string(),
-                            text: format!("Neighbor {} down", peer.fmt_short()),
-                            is_system: true,
-                        })
-                        .await;
-                }
-                _ => {}
-            }
-        }
-    });
-
-    // Sender task
-    let gossip_tx_s = gossip_tx.clone();
-    let endpoint_s = endpoint.clone();
-    let crypto_s = crypto.clone();
-
-    while *closed.lock().await == false
-        && let Some(text) = msg_rx.recv().await
-    {
-        let cs = crypto_s.lock().await;
-        let msg = if cs.is_ready() {
-            Message::new(MessageBody::Encrypted {
-                from: endpoint_s.id(),
-                data: cs.encrypt(text.as_bytes(), topic_id.as_bytes()),
-            })
-        } else {
-            Message::new(MessageBody::Message {
-                from: endpoint_s.id(),
-                text,
-            })
-        };
-        let _ = gossip_tx_s.broadcast(msg.to_vec().into()).await;
-    }
-
-    Ok(())
 }
 
 async fn run_app(
@@ -428,9 +174,6 @@ async fn run_app(
                 }
                 UiEvent::PeerUpdate { id, name } => {
                     app.peers.insert(id, name);
-                }
-                UiEvent::PeerLeft { id } => {
-                    app.peers.remove(&id);
                 }
             }
         }
@@ -544,24 +287,10 @@ struct Message {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum MessageBody {
-    AboutMe {
-        from: EndpointId,
-        name: String,
-    },
-    KeyExchange {
-        from: EndpointId,
-        public_key: Vec<u8>,
-        static_public_key: Vec<u8>,
-        signature: Vec<u8>,
-    },
-    Message {
-        from: EndpointId,
-        text: String,
-    },
-    Encrypted {
-        from: EndpointId,
-        data: Vec<u8>,
-    },
+    AboutMe { from: String, name: String },
+    KeyExchange { from: String, public_key: Vec<u8> },
+    Message { from: String, text: String },
+    Encrypted { from: String, data: Vec<u8> },
 }
 
 impl Message {

@@ -1,7 +1,7 @@
 # Patronus Protocol Specification (v1.0)
 
 **Abstract**
-This document specifies the Patronus Protocol, a peer-to-peer (P2P) encryption and identity framework designed for decentralized communication. The protocol utilizes Iroh for transport and discovery, and employs modern cryptographic primitives to ensure end-to-end security, forward secrecy, and deterministic identity verification.
+This document specifies the Patronus Protocol, a peer-to-peer (P2P) encryption and identity framework designed for decentralized communication. The protocol utilizes Iroh for transport and discovery, and employs modern cryptographic primitives to ensure end-to-end security, forward secrecy, and deterministic identity verification. As of now, Patronus, is meant to be used for local only networks.
 
 ---
 
