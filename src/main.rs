@@ -44,17 +44,17 @@ enum UiEvent {
         node_id: String,
     },
     PeerUpdate {
-        id: EndpointId,
+        id: String,
         name: String,
     },
     PeerLeft {
-        id: EndpointId,
+        id: String,
     },
 }
 
 struct App {
     messages: Vec<(String, String, bool)>, // (Sender, Content, IsSystem)
-    peers: HashMap<EndpointId, String>,
+    peers: HashMap<String, String>,
     local_node_id: String,
     identity_phrase: Option<String>,
     input: String,
@@ -124,10 +124,9 @@ yTEW25wy/dl9IERplnQrAAAAD3Rmb0B3YXJyb3Zlci1ycAECAwQFBg==
     let app_port: u16 = (rand::random::<u16>() % 255) + 6000;
     let discovery = Arc::new(DiscoveryService::new(app_port, res.to_string()));
 
-    let discovery_clone = discovery.clone();
-    tokio::spawn(async move {
-        discovery_clone.start();
-    });
+    let ui_tx_disc = ui_tx.clone();
+
+    discovery.start(ui_tx_disc);
 
     // UI loop
     let mut terminal = ratatui::init();
@@ -209,7 +208,7 @@ async fn run_iroh(
                                 peer_names.insert(from, name.clone());
                                 let _ = ui_tx_c
                                     .send(UiEvent::PeerUpdate {
-                                        id: from,
+                                        id: from.to_string(),
                                         name: name.clone(),
                                     })
                                     .await;
@@ -290,7 +289,11 @@ async fn run_iroh(
                     let _ = gossip_tx_r.broadcast(intro.to_vec().into()).await;
                 }
                 Event::NeighborDown(peer) => {
-                    let _ = ui_tx_c.send(UiEvent::PeerLeft { id: peer }).await;
+                    let _ = ui_tx_c
+                        .send(UiEvent::PeerLeft {
+                            id: peer.to_string(),
+                        })
+                        .await;
                     let _ = ui_tx_c
                         .send(UiEvent::Message {
                             from: "System".to_string(),
@@ -408,9 +411,6 @@ fn render(f: &mut Frame, app: &App) {
         .as_deref()
         .unwrap_or("Waiting for handshake...");
     let info_text = vec![Line::from(vec![
-        Span::styled("NodeID: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(&app.local_node_id),
-        Span::raw(" | "),
         Span::styled("Identity: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(identity, Style::default().fg(Color::Cyan)),
     ])];
@@ -440,10 +440,7 @@ fn render(f: &mut Frame, app: &App) {
             ListItem::new(Line::from(vec![
                 Span::styled(name, Style::default().fg(Color::Yellow)),
                 Span::raw(" ("),
-                Span::styled(
-                    id.fmt_short().to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(id, Style::default().fg(Color::DarkGray)),
                 Span::raw(")"),
             ]))
         })

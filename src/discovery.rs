@@ -4,6 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use tokio::sync::mpsc;
+
+use crate::UiEvent;
 
 const DISCOVERY_PORT: u16 = 8888;
 
@@ -26,12 +29,12 @@ impl DiscoveryService {
         }
     }
 
-    pub fn start(&self) {
+    pub fn start(&self, tx: mpsc::Sender<UiEvent>) {
         self.is_running.store(true, Ordering::SeqCst);
 
         let mut handles = self.thread_handles.lock().unwrap();
         handles.push(self.start_broadcaster());
-        handles.push(self.start_listener());
+        handles.push(self.start_listener(tx));
     }
 
     pub fn stop(&self) {
@@ -75,9 +78,10 @@ impl DiscoveryService {
         })
     }
 
-    fn start_listener(&self) -> JoinHandle<()> {
+    fn start_listener(&self, tx: mpsc::Sender<UiEvent>) -> JoinHandle<()> {
         let magic_header = format!("PATRONUSv{}", env!("CARGO_PKG_VERSION"));
         let is_running = Arc::clone(&self.is_running);
+        let node_id = self.node_id.clone();
 
         thread::spawn(move || {
             let raw_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
@@ -105,10 +109,16 @@ impl DiscoveryService {
                         let parts: Vec<&str> = msg.split('|').collect();
 
                         if parts.len() == 3 && parts[0] == magic_header {
-                            let _incoming_node_id = parts[1].to_string();
+                            let other_node_id = parts[2].to_string();
 
-                            //we know it's a patronus of instance of current version
-                            //now we should emit ui event to actually let the UI know that we found someone
+                            if node_id == other_node_id {
+                                continue;
+                            }
+
+                            let _ = tx.blocking_send(UiEvent::PeerUpdate {
+                                id: other_node_id.to_owned(),
+                                name: other_node_id,
+                            });
                         }
                     }
                     Err(e) => {
