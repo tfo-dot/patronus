@@ -82,8 +82,11 @@ impl DiscoveryService {
         thread::spawn(move || {
             let raw_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
 
-            raw_socket.set_reuse_port(true).unwrap();
             raw_socket.set_reuse_address(true).unwrap();
+            #[cfg(unix)]
+            {
+                raw_socket.set_reuse_port(true).unwrap();
+            }
 
             let addr: SocketAddr = format!("0.0.0.0:{}", DISCOVERY_PORT).parse().unwrap();
             raw_socket.bind(&addr.into()).unwrap();
