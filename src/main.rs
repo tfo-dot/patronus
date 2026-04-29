@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use ssh_key::PrivateKey;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::crypto::CryptoState;
+use crate::crypto::{CryptoState, node_id_from, sign_ephemeral};
 use ratatui::{
     DefaultTerminal, Frame,
-    crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind},
+    crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -58,6 +58,7 @@ struct App {
     local_node_id: String,
     identity_phrase: Option<String>,
     input: String,
+    broadcasting: bool,
 }
 
 impl App {
@@ -68,6 +69,7 @@ impl App {
             local_node_id: "Initializing...".to_string(),
             identity_phrase: None,
             input: String::new(),
+            broadcasting: true,
         }
     }
 }
@@ -92,9 +94,16 @@ yTEW25wy/dl9IERplnQrAAAAD3Rmb0B3YXJyb3Zlci1ycAECAwQFBg==
             )
         }
     }
-    .unwrap();
+        .unwrap();
 
-    let res = pk.public_key().fingerprint(ssh_key::HashAlg::Sha256);
+    // Extract ed25519 seed for handshake signatures
+    let signing_key = {
+        let kp = pk.key_data().ed25519().expect("ed25519 key");
+        let seed: [u8; 32] = kp.private.as_ref()[..32].try_into().unwrap();
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+    };
+
+    let local_node_id = node_id_from(signing_key.verifying_key().as_bytes());
 
     let crypto = Arc::new(Mutex::new(CryptoState::new()));
     let closed = Arc::new(Mutex::new(false));
@@ -110,7 +119,7 @@ yTEW25wy/dl9IERplnQrAAAAD3Rmb0B3YXJyb3Zlci1ycAECAwQFBg==
         let iroh_tx = ui_tx_iroh.clone();
         let error_tx = ui_tx_iroh.clone();
 
-        if let Err(e) = run_iroh(name, crypto_iroh, iroh_tx, &mut msg_rx, is_closed).await {
+        if let Err(e) = run_iroh(name, crypto_iroh, iroh_tx, &mut msg_rx, is_closed, signing_key).await {
             let _ = error_tx
                 .send(UiEvent::Message {
                     from: "Error".to_string(),
@@ -122,7 +131,7 @@ yTEW25wy/dl9IERplnQrAAAAD3Rmb0B3YXJyb3Zlci1ycAECAwQFBg==
     });
 
     let app_port: u16 = (rand::random::<u16>() % 255) + 6000;
-    let discovery = Arc::new(DiscoveryService::new(app_port, res.to_string()));
+    let discovery = Arc::new(DiscoveryService::new(app_port, local_node_id.clone()));
 
     let ui_tx_disc = ui_tx.clone();
 
@@ -130,7 +139,7 @@ yTEW25wy/dl9IERplnQrAAAAD3Rmb0B3YXJyb3Zlci1ycAECAwQFBg==
 
     // UI loop
     let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal, app, ui_rx, msg_tx).await;
+    let result = run_app(&mut terminal, app, ui_rx, msg_tx, discovery.clone()).await;
 
     ratatui::restore();
 
@@ -146,6 +155,7 @@ async fn run_iroh(
     ui_tx: mpsc::Sender<UiEvent>,
     msg_rx: &mut mpsc::Receiver<String>,
     closed: Arc<Mutex<bool>>,
+    signing_key: ed25519_dalek::SigningKey,
 ) -> Result<()> {
     let endpoint = Endpoint::builder(presets::N0).bind().await?;
 
@@ -155,17 +165,17 @@ async fn run_iroh(
         .accept(iroh_gossip::ALPN, gossip.clone())
         .spawn();
 
-    let node_id = endpoint.id();
+    let local_node_id = node_id_from(signing_key.verifying_key().as_bytes());
     ui_tx
         .send(UiEvent::LocalInfo {
-            node_id: node_id.to_string(),
+            node_id: local_node_id.clone(),
         })
         .await?;
 
     ui_tx
         .send(UiEvent::Message {
             from: "System".to_string(),
-            text: format!("Welcome to Patronus. Your NodeID is {}", node_id),
+            text: format!("Welcome to Patronus. Your NodeID is {}", local_node_id),
             is_system: true,
         })
         .await?;
@@ -179,6 +189,12 @@ async fn run_iroh(
     let endpoint_c = endpoint.clone();
     let name_c = name.clone();
     let gossip_tx_r = gossip_tx.clone();
+    let topic_bytes = *topic_id.as_bytes();
+
+    // Sign our ephemeral key before spawning (§4.1)
+    let ephemeral_pk = crypto_c.lock().await.local_public;
+    let handshake_sig = sign_ephemeral(&ephemeral_pk, &signing_key);
+    let static_pk_bytes = signing_key.verifying_key().to_bytes().to_vec();
 
     // Gossip receiver task
     tokio::spawn(async move {
@@ -191,11 +207,12 @@ async fn run_iroh(
         });
         let _ = gossip_tx_r.broadcast(intro.to_vec().into()).await;
 
-        // Broadcast our public key for handshake
-        let pk = crypto_c.lock().await.local_public;
+        // Broadcast our public key + signature for handshake
         let kex = Message::new(MessageBody::KeyExchange {
             from: endpoint_c.id(),
-            public_key: pk.as_bytes().to_vec(),
+            public_key: ephemeral_pk.as_bytes().to_vec(),
+            static_public_key: static_pk_bytes.clone(),
+            signature: handshake_sig.clone(),
         });
         let _ = gossip_tx_r.broadcast(kex.to_vec().into()).await;
 
@@ -225,18 +242,37 @@ async fn run_iroh(
                                     .await;
                             }
                             MessageBody::KeyExchange {
-                                from: _,
+                                from,
                                 public_key,
+                                static_public_key,
+                                signature,
                             } => {
-                                if public_key.len() == 32 {
+                                if public_key.len() == 32 && static_public_key.len() == 32 {
                                     let peer_public = x25519_dalek::PublicKey::from(
                                         <[u8; 32]>::try_from(&public_key[..]).unwrap(),
                                     );
+                                    let spk: [u8; 32] = static_public_key.try_into().unwrap();
                                     let mut cs = crypto_c.lock().await;
                                     if !cs.is_ready() {
-                                        let code = cs.complete_handshake(&peer_public);
-                                        let _ =
-                                            ui_tx_c.send(UiEvent::HandshakeComplete(code)).await;
+                                        match cs.complete_handshake(&peer_public, &spk, &signature) {
+                                            Ok(code) => {
+                                                let _ = ui_tx_c
+                                                    .send(UiEvent::HandshakeComplete(code))
+                                                    .await;
+                                            }
+                                            Err(e) => {
+                                                let _ = ui_tx_c
+                                                    .send(UiEvent::Message {
+                                                        from: "System".to_string(),
+                                                        text: format!(
+                                                            "Handshake with {} failed: {e}",
+                                                            from.fmt_short()
+                                                        ),
+                                                        is_system: true,
+                                                    })
+                                                    .await;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -255,7 +291,7 @@ async fn run_iroh(
                             }
                             MessageBody::Encrypted { from, data } => {
                                 let cs = crypto_c.lock().await;
-                                if let Ok(plaintext) = cs.decrypt(&data) {
+                                if let Ok(plaintext) = cs.decrypt(&data, &topic_bytes) {
                                     let text = String::from_utf8_lossy(&plaintext).to_string();
                                     let name = peer_names
                                         .get(&from)
@@ -319,7 +355,7 @@ async fn run_iroh(
         let msg = if cs.is_ready() {
             Message::new(MessageBody::Encrypted {
                 from: endpoint_s.id(),
-                data: cs.encrypt(text.as_bytes()),
+                data: cs.encrypt(text.as_bytes(), topic_id.as_bytes()),
             })
         } else {
             Message::new(MessageBody::Message {
@@ -338,6 +374,7 @@ async fn run_app(
     mut app: App,
     mut ui_rx: mpsc::Receiver<UiEvent>,
     msg_tx: mpsc::Sender<String>,
+    discovery: Arc<DiscoveryService>,
 ) -> Result<()> {
     loop {
         terminal.draw(|f| render(f, &app))?;
@@ -353,6 +390,11 @@ async fn run_app(
                                     app.messages.push(("Me".to_string(), input, false));
                                 }
                             }
+                        }
+                        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let new_state = !discovery.is_broadcasting();
+                            discovery.set_broadcasting(new_state);
+                            app.broadcasting = new_state;
                         }
                         KeyCode::Char(c) => {
                             app.input.push(c);
@@ -410,9 +452,17 @@ fn render(f: &mut Frame, app: &App) {
         .identity_phrase
         .as_deref()
         .unwrap_or("Waiting for handshake...");
+    let (broadcast_label, broadcast_color) = if app.broadcasting {
+        ("ON", Color::Green)
+    } else {
+        ("OFF", Color::Red)
+    };
     let info_text = vec![Line::from(vec![
         Span::styled("Identity: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(identity, Style::default().fg(Color::Cyan)),
+        Span::raw(" | "),
+        Span::styled("Broadcast: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(broadcast_label, Style::default().fg(broadcast_color)),
     ])];
     let info = Paragraph::new(info_text).block(
         Block::default()
@@ -481,7 +531,7 @@ fn render(f: &mut Frame, app: &App) {
     let input = Paragraph::new(app.input.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Message (Esc to quit)"),
+            .title("Message (Esc to quit, Ctrl+B to toggle broadcast)"),
     );
     f.render_widget(input, main_layout[2]);
 }
@@ -501,6 +551,8 @@ enum MessageBody {
     KeyExchange {
         from: EndpointId,
         public_key: Vec<u8>,
+        static_public_key: Vec<u8>,
+        signature: Vec<u8>,
     },
     Message {
         from: EndpointId,

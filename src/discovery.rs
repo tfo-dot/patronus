@@ -15,6 +15,7 @@ pub struct DiscoveryService {
     node_id: String,
 
     is_running: Arc<AtomicBool>,
+    broadcasting: Arc<AtomicBool>,
     thread_handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -25,16 +26,17 @@ impl DiscoveryService {
             node_id,
 
             is_running: Arc::new(AtomicBool::new(false)),
+            broadcasting: Arc::new(AtomicBool::new(true)),
             thread_handles: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn start(&self, tx: mpsc::Sender<UiEvent>) {
+    pub fn start(&self, ui_tx: mpsc::Sender<UiEvent>) {
         self.is_running.store(true, Ordering::SeqCst);
 
         let mut handles = self.thread_handles.lock().unwrap();
         handles.push(self.start_broadcaster());
-        handles.push(self.start_listener(tx));
+        handles.push(self.start_listener(ui_tx));
     }
 
     pub fn stop(&self) {
@@ -46,6 +48,14 @@ impl DiscoveryService {
         }
     }
 
+    pub fn set_broadcasting(&self, enabled: bool) {
+        self.broadcasting.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn is_broadcasting(&self) -> bool {
+        self.broadcasting.load(Ordering::SeqCst)
+    }
+
     fn start_broadcaster(&self) -> JoinHandle<()> {
         let magic_header = format!("PATRONUSv{}", env!("CARGO_PKG_VERSION"));
 
@@ -53,6 +63,7 @@ impl DiscoveryService {
         let node_id = self.node_id.clone();
 
         let is_running = Arc::clone(&self.is_running);
+        let broadcasting = Arc::clone(&self.broadcasting);
 
         thread::spawn(move || {
             let socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to bind broadcaster");
@@ -64,8 +75,10 @@ impl DiscoveryService {
             let broadcast_addr = format!("255.255.255.255:{}", DISCOVERY_PORT);
 
             while is_running.load(Ordering::SeqCst) {
-                if let Err(e) = socket.send_to(payload.as_bytes(), &broadcast_addr) {
-                    eprintln!("Failed to send broadcast: {}", e);
+                if broadcasting.load(Ordering::SeqCst) {
+                    if let Err(e) = socket.send_to(payload.as_bytes(), &broadcast_addr) {
+                        eprintln!("Failed to send broadcast: {}", e);
+                    }
                 }
 
                 for _ in 0..30 {
@@ -78,10 +91,10 @@ impl DiscoveryService {
         })
     }
 
-    fn start_listener(&self, tx: mpsc::Sender<UiEvent>) -> JoinHandle<()> {
+    fn start_listener(&self, ui_tx: mpsc::Sender<UiEvent>) -> JoinHandle<()> {
         let magic_header = format!("PATRONUSv{}", env!("CARGO_PKG_VERSION"));
         let is_running = Arc::clone(&self.is_running);
-        let node_id = self.node_id.clone();
+        let self_node_id = self.node_id.clone();
 
         thread::spawn(move || {
             let raw_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
@@ -108,16 +121,21 @@ impl DiscoveryService {
                         let msg = String::from_utf8_lossy(&buf[..amt]);
                         let parts: Vec<&str> = msg.split('|').collect();
 
+                        // payload: magic_header | app_port | node_id
                         if parts.len() == 3 && parts[0] == magic_header {
-                            let other_node_id = parts[2].to_string();
+                            let incoming_node_id = parts[2].to_string();
 
-                            if node_id == other_node_id {
+                            // ignore broadcasts looped back from ourselves
+                            if incoming_node_id == self_node_id {
                                 continue;
                             }
 
-                            let _ = tx.blocking_send(UiEvent::PeerUpdate {
-                                id: other_node_id.to_owned(),
-                                name: other_node_id,
+                            // name is a placeholder until the real handshake fills it in
+                            let short_name: String =
+                                incoming_node_id.chars().take(8).collect();
+                            let _ = ui_tx.try_send(UiEvent::PeerUpdate {
+                                id: incoming_node_id,
+                                name: short_name,
                             });
                         }
                     }
