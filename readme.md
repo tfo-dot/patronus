@@ -17,4 +17,8 @@ Furthermore, in specific conditions—such as air-gapped networks in military or
 * **Privacy by Isolation:** Your data never leaves the building because it physically can't.
 ---
 
+## Keys
+
+If no key pair are provided by the user, the app will generate it for them. `Keys` directory contains two key pairs to test the connection and are only meant to be used in developement process.
+
 *“Happiness can be found, even in the darkest of university basements, if one only remembers to turn on the LAN.”*

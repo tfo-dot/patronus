@@ -1,7 +1,7 @@
 # Patronus Protocol Specification (v1.0)
 
 **Abstract**
-This document specifies the Patronus Protocol, a peer-to-peer (P2P) encryption and identity framework designed for decentralized communication. The protocol utilizes Iroh for transport and discovery, and employs modern cryptographic primitives to ensure end-to-end security, forward secrecy, and deterministic identity verification.
+This document specifies the Patronus Protocol, a peer-to-peer (P2P) encryption and identity framework designed for decentralized communication. The protocol utilizes Iroh for transport and discovery, and employs modern cryptographic primitives to ensure end-to-end security, forward secrecy, and deterministic identity verification. As of now, Patronus, is meant to be used for local only networks.
 
 ---
 
@@ -22,28 +22,19 @@ Each node MUST generate a static, long-term Ed25519 keypair upon initialization.
 ## 2. Node Discovery and Rendezvous
 Nodes MUST implement a multi-layered discovery strategy to facilitate peer-to-peer connectivity.
 
-### 2.1 Local Discovery (mDNS)
-Nodes on a shared broadcast domain MUST utilize Multicast DNS (mDNS) [RFC6762] for local peer discovery.
-- **Service Name:** `_patronus._udp.local`
-- **Announcement:** Nodes MUST broadcast their `NodeID` and the port on which they are listening for incoming QUIC connections.
-- **Resolution:** Nodes MUST be capable of resolving `NodeID`s to IPv4/IPv6 addresses via the mDNS service.
+### 2.1 Local Discovery (UDP Broadcast)
+Nodes on a shared broadcast domain MUST utilize UDP broadcast for local peer discovery.
+- **Discovery Port:** `8888`
+- **Payload Format:** `PATRONUSv<VERSION>|<APP_PORT>|<NODE_ID>`
+    - `VERSION`: The current package version, fully quialified semver version.
+    - `APP_PORT`: The port on which the node is listening.
+    - `NODE_ID`: The node's unique identifier.
+- **Announcement:** Nodes SHOULD broadcast their discovery payload every 3 seconds.
 
-### 2.2 Node Metadata (TXT Records)
-During the discovery phase, nodes SHOULD exchange metadata via mDNS TXT records. The TXT record MUST contain the following key-value pairs:
-- `name`: A UTF-8 encoded string representing the node's human-readable alias.
-- `status`: An OPTIONAL UTF-8 string indicating the node's current state.
-- `version`: The protocol version (MUST be "1.0").
+Every client can receive these packets even if they're not broadcasting their own, only clients wishing to initiate a connection SHOULD respond to the received packets.
 
-### 2.3 Topic-Based Discovery
-Group communication is facilitated via `TopicID`s.
-- **Join Procedure:** Peers MAY establish connectivity by sharing a `Ticket`.
-- **Ticket Binary Layout:** A `Ticket` MUST be a Base32-encoded string of the following concatenated binary fields:
-    1. **TopicID:** 32 bytes.
-    2. **NodeID:** 32 bytes.
-    3. **Address Type:** 1 byte (0x01: IPv4, 0x02: IPv6, 0x03: DNS).
-    4. **Address Data:** 4 bytes (IPv4), 16 bytes (IPv6), or variable (DNS: 1-byte length prefix followed by up to 255 bytes of UTF-8 string).
-    5. **Port:** 2 bytes (Big Endian).
-- **Passive Scanning:** Nodes MAY scan for "Public Topics" advertised on the local network.
+### 2.2 Node Metadata
+In the current implementation, basic metadata (Version, App Port, and NodeID) is encapsulated directly in the broadcast payload. Future versions MAY extend this using additional pipe-delimited fields or JSON payloads.
 
 ---
 
