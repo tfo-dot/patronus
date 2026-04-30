@@ -1,15 +1,14 @@
-use std::io::Cursor;
-use anyhow::{Result, anyhow};
-use tokio_util::bytes::{Buf, BufMut, BytesMut};
-use ed25519_dalek::{SigningKey, VerifyingKey, Signature};
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
-use tokio_util::codec::{Decoder, Encoder, Framed};
-use x25519_dalek::PublicKey;
 use crate::crypto::CryptoState;
+use anyhow::{Result, anyhow};
 use data_encoding::BASE64;
-use std::io::Read;
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use std::io::Cursor;
+use std::io::Read;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::bytes::BufMut;
+use x25519_dalek::PublicKey;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HandshakePacket {
@@ -19,45 +18,6 @@ pub struct HandshakePacket {
     pub spk: String,
     pub sig: String,
     pub extensions: Vec<String>,
-}
-
-pub struct PatronusCodec;
-
-impl Decoder for PatronusCodec {
-    type Item = Vec<u8>;
-    type Error = anyhow::Error;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>> {
-        if src.len() < 2 {
-            return Ok(None);
-        }
-
-        let mut len_bytes = [0u8; 2];
-        len_bytes.copy_from_slice(&src[..2]);
-        let length = u16::from_be_bytes(len_bytes) as usize;
-
-        if src.len() < 2 + length {
-            src.reserve(2 + length - src.len());
-            return Ok(None);
-        }
-
-        src.advance(2);
-        let data = src.split_to(length).to_vec();
-        Ok(Some(data))
-    }
-}
-
-impl Encoder<Vec<u8>> for PatronusCodec {
-    type Error = anyhow::Error;
-
-    fn encode(&mut self, item: Vec<u8>, dst: &mut BytesMut) -> Result<()> {
-        if item.len() > u16::MAX as usize {
-            return Err(anyhow!("Payload too large"));
-        }
-        dst.put_u16(item.len() as u16);
-        dst.extend_from_slice(&item);
-        Ok(())
-    }
 }
 
 pub struct PatronusClient {
@@ -77,8 +37,9 @@ impl PatronusClient {
         }
     }
 
-    pub async fn handshake<S>(&mut self, stream: &mut S) -> Result<()> 
-    where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin 
+    pub async fn handshake<S>(&mut self, stream: &mut S) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         // 1. Prepare our handshake packet
         let ephemeral_pk = self.crypto.local_ephemeral_public;
@@ -94,7 +55,7 @@ impl PatronusClient {
         };
 
         let handshake_json = serde_json::to_vec(&handshake)?;
-        
+
         // Write handshake (6.1: 2-byte BE length + JSON)
         stream.write_u16(handshake_json.len() as u16).await?;
         stream.write_all(&handshake_json).await?;
@@ -105,35 +66,52 @@ impl PatronusClient {
         stream.read_exact(&mut peer_handshake_buf).await?;
 
         let peer_handshake: HandshakePacket = serde_json::from_slice(&peer_handshake_buf)?;
-        
+
         // Verify peer handshake
         let peer_ephemeral_pk_bytes = BASE64.decode(peer_handshake.pk.as_bytes())?;
-        let peer_ephemeral_pk: [u8; 32] = peer_ephemeral_pk_bytes.try_into().map_err(|_| anyhow!("Invalid peer ephemeral key"))?;
+        let peer_ephemeral_pk: [u8; 32] = peer_ephemeral_pk_bytes
+            .try_into()
+            .map_err(|_| anyhow!("Invalid peer ephemeral key"))?;
         let peer_ephemeral_pk = PublicKey::from(peer_ephemeral_pk);
 
         let peer_static_pk_bytes = BASE64.decode(peer_handshake.spk.as_bytes())?;
-        let peer_static_pk = VerifyingKey::from_bytes(&peer_static_pk_bytes.try_into().map_err(|_| anyhow!("Invalid peer static key"))?)?;
+        let peer_static_pk = VerifyingKey::from_bytes(
+            &peer_static_pk_bytes
+                .try_into()
+                .map_err(|_| anyhow!("Invalid peer static key"))?,
+        )?;
 
         let peer_sig_bytes = BASE64.decode(peer_handshake.sig.as_bytes())?;
-        let peer_sig = Signature::from_bytes(&peer_sig_bytes.try_into().map_err(|_| anyhow!("Invalid peer signature"))?);
+        let peer_sig = Signature::from_bytes(
+            &peer_sig_bytes
+                .try_into()
+                .map_err(|_| anyhow!("Invalid peer signature"))?,
+        );
 
-        if !self.crypto.verify_handshake(&peer_static_pk, &peer_ephemeral_pk, &peer_sig) {
+        if !self
+            .crypto
+            .verify_handshake(&peer_static_pk, &peer_ephemeral_pk, &peer_sig)
+        {
             return Err(anyhow!("Handshake signature verification failed"));
         }
 
         // Negotiation (7.5.2)
-        self.selected_compression = peer_handshake.extensions.iter()
+        self.selected_compression = peer_handshake
+            .extensions
+            .iter()
             .find(|ext| ext.starts_with("compression:zstd"))
             .map(|ext| ext.to_string());
-        
+
         if self.selected_compression.is_none() {
             return Err(anyhow!("No common compression algorithm"));
         }
 
         // Complete handshake
-        let phrase = self.crypto.complete_handshake(&peer_ephemeral_pk, &peer_static_pk)
+        let phrase = self
+            .crypto
+            .complete_handshake(&peer_ephemeral_pk, &peer_static_pk)
             .map_err(|e| anyhow!(e))?;
-        
+
         self.identity_phrase = Some(phrase);
         let peer_node_id = sha2::Sha256::digest(peer_static_pk.as_bytes());
         self.peer_node_id = Some(BASE64.encode(&peer_node_id));
@@ -141,8 +119,13 @@ impl PatronusClient {
         Ok(())
     }
 
-    pub async fn send_app_message<S>(&self, stream: &mut S, json_content: &serde_json::Value) -> Result<()>
-    where S: tokio::io::AsyncWrite + Unpin
+    pub async fn send_app_message<S>(
+        &self,
+        stream: &mut S,
+        json_content: &serde_json::Value,
+    ) -> Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
     {
         let payload = serde_json::to_vec(json_content)?;
         let frame = self.encrypt_message(0x01, &payload)?; // 0x01: Application Message
@@ -151,7 +134,8 @@ impl PatronusClient {
     }
 
     pub async fn receive_message<S>(&self, stream: &mut S) -> Result<(u8, Vec<u8>)>
-    where S: tokio::io::AsyncRead + Unpin
+    where
+        S: tokio::io::AsyncRead + Unpin,
     {
         // 6.2: 2-byte length, 12-byte nonce, then length bytes (ciphertext+tag)
         let len = stream.read_u16().await?;
@@ -179,22 +163,22 @@ impl PatronusClient {
         // Section 6.2: Encrypted Message Frame
         // 12 bytes nonce is prepended by crypto.encrypt
         let encrypted = self.crypto.encrypt(&compressed);
-        
+
         // encrypted contains: nonce(12) + ciphertext(len) + tag(16)
         // Protocol 6.2 says:
         // 1. Frame Length: 2 bytes (Ciphertext + Tag)
         // 2. Nonce: 12 bytes
         // 3. Ciphertext
         // 4. Auth Tag
-        
+
         let nonce = &encrypted[..12];
         let ciphertext_and_tag = &encrypted[12..];
-        
+
         let mut frame = Vec::with_capacity(2 + 12 + ciphertext_and_tag.len());
         frame.put_u16(ciphertext_and_tag.len() as u16);
         frame.extend_from_slice(nonce);
         frame.extend_from_slice(ciphertext_and_tag);
-        
+
         Ok(frame)
     }
 
@@ -210,7 +194,9 @@ impl PatronusClient {
         data_to_decrypt.extend_from_slice(nonce);
         data_to_decrypt.extend_from_slice(ciphertext_and_tag);
 
-        let decrypted = self.crypto.decrypt(&data_to_decrypt)
+        let decrypted = self
+            .crypto
+            .decrypt(&data_to_decrypt)
             .map_err(|e| anyhow!(e))?;
 
         // Decompress

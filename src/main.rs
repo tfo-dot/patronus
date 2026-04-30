@@ -8,11 +8,9 @@ use anyhow::Result;
 use clap::Parser;
 use discovery::DiscoveryService;
 use ed25519_dalek::SigningKey;
-use serde::{Deserialize, Serialize};
 use ssh_key::{HashAlg, PrivateKey};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::crypto::CryptoState;
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers},
@@ -39,19 +37,18 @@ enum UiEvent {
         is_system: bool,
     },
     HandshakeComplete(String),
-    LocalInfo {
-        node_id: String,
-    },
     PeerUpdate {
         id: String,
         name: String,
+        addr: String,
     },
 }
 
 struct App {
     messages: Vec<(String, String, bool)>, // (Sender, Content, IsSystem)
-    peers: HashMap<String, String>,
-    local_node_id: String,
+    peers: HashMap<String, (String, String)>, //(Name, Address)
+    peer_ids: Vec<String>,
+    selected: usize,
     identity_phrase: Option<String>,
     input: String,
     broadcasting: bool,
@@ -62,7 +59,8 @@ impl App {
         Self {
             messages: Vec::new(),
             peers: HashMap::new(),
-            local_node_id: "Initializing...".to_string(),
+            peer_ids: Vec::new(),
+            selected: 0,
             identity_phrase: None,
             input: String::new(),
             broadcasting: true,
@@ -84,19 +82,28 @@ async fn main() -> Result<()> {
     let binding = pk.public_key().fingerprint(HashAlg::Sha256).to_string();
     let local_node_id = binding.strip_prefix("SHA256:").unwrap();
 
-
-
     let ed_sk = pk.key_data().ed25519().expect("Ed25519 key required");
     let signing_key = SigningKey::from_bytes(ed_sk.private.as_ref());
 
-    let _crypto = Arc::new(Mutex::new(CryptoState::new(signing_key)));
     let closed = Arc::new(Mutex::new(false));
     let app = App::new();
 
     let (ui_tx, ui_rx) = mpsc::channel(100);
-    let (msg_tx, _msg_rx) = mpsc::channel::<String>(100);
+    let (msg_tx, msg_rx) = mpsc::channel::<String>(100);
+    let (connect_tx, connect_rx) = mpsc::channel::<String>(100);
 
     let app_port: u16 = (rand::random::<u16>() % 255) + 6000;
+
+    let ui_tx_net = ui_tx.clone();
+    let singing_key_net = signing_key.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = run_network(singing_key_net, app_port, ui_tx_net, msg_rx, connect_rx).await
+        {
+            eprintln!("Network error: {}", e);
+        }
+    });
+
     let discovery = Arc::new(DiscoveryService::new(app_port, local_node_id.to_string()));
 
     let ui_tx_disc = ui_tx.clone();
@@ -105,7 +112,15 @@ async fn main() -> Result<()> {
 
     // UI loop
     let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal, app, ui_rx, msg_tx, discovery.clone()).await;
+    let result = run_app(
+        &mut terminal,
+        app,
+        ui_rx,
+        msg_tx,
+        connect_tx,
+        discovery.clone(),
+    )
+    .await;
 
     ratatui::restore();
 
@@ -120,6 +135,7 @@ async fn run_app(
     mut app: App,
     mut ui_rx: mpsc::Receiver<UiEvent>,
     msg_tx: mpsc::Sender<String>,
+    connect_tx: mpsc::Sender<String>,
     discovery: Arc<DiscoveryService>,
 ) -> Result<()> {
     loop {
@@ -135,6 +151,25 @@ async fn run_app(
                                 if msg_tx.try_send(input.clone()).is_ok() {
                                     app.messages.push(("Me".to_string(), input, false));
                                 }
+                            } else if !app.peer_ids.is_empty() {
+                                let peer_id = &app.peer_ids[app.selected];
+                                if let Some((_, addr)) = app.peers.get(peer_id) {
+                                    let _ = connect_tx.try_send(addr.clone());
+                                }
+                            }
+                        }
+                        KeyCode::Up => {
+                            if !app.peer_ids.is_empty() {
+                                app.selected = if app.selected > 0 {
+                                    app.selected - 1
+                                } else {
+                                    app.peer_ids.len() - 1
+                                }
+                            }
+                        }
+                        KeyCode::Down => {
+                            if !app.peer_ids.is_empty() {
+                                app.selected = (app.selected + 1) % app.peer_ids.len();
                             }
                         }
                         KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -169,11 +204,144 @@ async fn run_app(
                 UiEvent::HandshakeComplete(code) => {
                     app.identity_phrase = Some(code);
                 }
-                UiEvent::LocalInfo { node_id } => {
-                    app.local_node_id = node_id;
+                UiEvent::PeerUpdate { id, name, addr } => {
+                    if !app.peers.contains_key(&id) {
+                        app.peer_ids.push(id.clone());
+                        app.peer_ids.sort_by(|a, b| {
+                            let name_a = &app.peers.get(a).map(|p| p.0.as_str()).unwrap_or(a);
+                            let name_b = &app.peers.get(b).map(|p| p.0.as_str()).unwrap_or(b);
+
+                            name_a.cmp(name_b)
+                        });
+                    }
+
+                    app.peers.insert(id, (name, addr));
                 }
-                UiEvent::PeerUpdate { id, name } => {
-                    app.peers.insert(id, name);
+            }
+        }
+    }
+}
+
+async fn run_network(
+    singing_key: SigningKey,
+    app_port: u16,
+    ui_tx: mpsc::Sender<UiEvent>,
+    mut msg_rx: mpsc::Receiver<String>,
+    mut connect_rx: mpsc::Receiver<String>,
+) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", app_port)).await?;
+    let mut client = client::PatronusClient::new(singing_key);
+
+    loop {
+        tokio::select! {
+            incoming = listener.accept() => {
+                if let Ok((mut stream, _)) = incoming {
+                    if let Err(e) = client.handshake(&mut stream).await {
+                        let _ = ui_tx.try_send(UiEvent::Message{
+                            from: "System".to_string(),
+                            text: format!("Inbound handshake failed {}", e),
+                            is_system: true
+                        });
+
+                        continue;
+                    }
+
+                    if let Some(phrase) = &client.identity_phrase {
+                        let _ = ui_tx.send(UiEvent::HandshakeComplete(phrase.clone())).await;
+                    }
+
+                    handle_connection(&client, stream, ui_tx.clone(), &mut msg_rx).await?;
+                }
+            }
+
+                outgoing_addr = connect_rx.recv() => {
+                    if let Some(addr) = outgoing_addr {
+                        match tokio::net::TcpStream::connect(&addr).await {
+                            Ok(mut stream) => {
+                                if let Err(e) = client.handshake(&mut stream).await {
+                                    let _ = ui_tx.send(UiEvent::Message{
+                                        from: "System".to_string(),
+                                        text: format!("Outbound handshake failed {}", e),
+                                        is_system: true
+                                    }).await;
+
+                                    continue;
+                                }
+
+                                if let Some(phrase) = &client.identity_phrase {
+                        let _ = ui_tx.send(UiEvent::HandshakeComplete(phrase.clone())).await;
+                    }
+
+                    handle_connection(&client, stream, ui_tx.clone(), &mut msg_rx).await?;
+                            }
+                            Err(e) => {
+                                let _ = ui_tx.send(UiEvent::Message{
+                                    from: "System".to_string(),
+                                    text: format!("Connection to {} failed: {}", addr, e),
+                                    is_system: true
+                                }).await;
+                            }
+                        }
+                    }
+            }
+        }
+    }
+}
+
+async fn handle_connection<S>(
+    client: &client::PatronusClient,
+    mut stream: S,
+    ui_tx: mpsc::Sender<UiEvent>,
+    msg_rx: &mut mpsc::Receiver<String>,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let _ = ui_tx
+        .send(UiEvent::Message {
+            from: "System".to_string(),
+            text: "Connect to peer".to_string(),
+            is_system: true,
+        })
+        .await;
+
+    loop {
+        tokio::select! {
+            msg = msg_rx.recv() => {
+                if let Some(text) = msg {
+                    let json = serde_json::json!({ "text": text });
+                    client.send_app_message(&mut stream, &json).await?;
+                }
+            }
+
+            res = client.receive_message(&mut stream) => {
+                match res {
+                    Ok((0x01, payload)) => {
+                        let json: serde_json::Value = serde_json::from_slice(&payload)?;
+                        if let Some(text) = json["text"].as_str() {
+                            let _ = ui_tx.send(UiEvent::Message {
+                                from: "Peer".to_string(),
+                                text: text.to_string(),
+                                is_system: false,
+                            }).await;
+                        }
+                    }
+                    Ok((message_type, _)) => {
+                        let _ = ui_tx.send(UiEvent::Message {
+                            from: "System".to_string(),
+                            text: format!("Received unknown message type: 0x{:02x}", message_type),
+                            is_system: false
+                        }).await;
+                    }
+                    Err(e) => {
+                        let _ = ui_tx.send(UiEvent::Message {
+                            from: "System".to_string(),
+                            text: format!("Connection lost {}", e),
+                            is_system: true
+                        }).await;
+
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -223,15 +391,20 @@ fn render(f: &mut Frame, app: &App) {
         ])
         .split(main_layout[1]);
 
-    // Peers List
-    let mut peers_data: Vec<_> = app.peers.iter().collect();
-    peers_data.sort_by(|a, b| a.1.cmp(b.1));
+    let peers: Vec<ListItem> = app
+        .peer_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let (name, _addr): &(String, String) = app.peers.get(id).unwrap();
+            let style = if i == app.selected {
+                Style::default().fg(Color::Black).bg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
 
-    let peers: Vec<ListItem> = peers_data
-        .into_iter()
-        .map(|(id, name)| {
             ListItem::new(Line::from(vec![
-                Span::styled(name, Style::default().fg(Color::Yellow)),
+                Span::styled(name.as_str(), style),
                 Span::raw(" ("),
                 Span::styled(id, Style::default().fg(Color::DarkGray)),
                 Span::raw(")"),
@@ -250,6 +423,7 @@ fn render(f: &mut Frame, app: &App) {
     let messages: Vec<ListItem> = app
         .messages
         .iter()
+        .rev()
         .map(|(from, content, is_system)| {
             let style = if *is_system {
                 Style::default()
@@ -277,35 +451,4 @@ fn render(f: &mut Frame, app: &App) {
             .title("Message (Esc to quit, Ctrl+B to toggle broadcast)"),
     );
     f.render_widget(input, main_layout[2]);
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Message {
-    body: MessageBody,
-    nonce: [u8; 16],
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-enum MessageBody {
-    AboutMe { from: String, name: String },
-    KeyExchange { from: String, public_key: Vec<u8> },
-    Message { from: String, text: String },
-    Encrypted { from: String, data: Vec<u8> },
-}
-
-impl Message {
-    fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        serde_json::from_slice(bytes).map_err(Into::into)
-    }
-
-    pub fn new(body: MessageBody) -> Self {
-        Self {
-            body,
-            nonce: rand::random(),
-        }
-    }
-
-    pub fn to_vec(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("serde_json::to_vec is infallible")
-    }
 }

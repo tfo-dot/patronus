@@ -117,7 +117,7 @@ impl DiscoveryService {
 
             while is_running.load(Ordering::SeqCst) {
                 match socket.recv_from(&mut buf) {
-                    Ok((amt, _src)) => {
+                    Ok((amt, src)) => {
                         let msg = String::from_utf8_lossy(&buf[..amt]);
                         let parts: Vec<&str> = msg.split('|').collect();
 
@@ -131,11 +131,14 @@ impl DiscoveryService {
                             }
 
                             // name is a placeholder until the real handshake fills it in
-                            let short_name: String =
-                                incoming_node_id.chars().take(8).collect();
+                            let short_name: String = incoming_node_id.chars().take(8).collect();
+
+                            let addr = format!("{}:{}", src.ip(), parts[1]);
+
                             let _ = ui_tx.try_send(UiEvent::PeerUpdate {
                                 id: incoming_node_id,
                                 name: short_name,
+                                addr,
                             });
                         }
                     }

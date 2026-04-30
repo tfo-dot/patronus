@@ -1,13 +1,13 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
 };
-use ed25519_dalek::{Signature, Signer, Verifier, SigningKey, VerifyingKey};
-use serde_json::Value;
-use sha2::{Sha256, Digest};
-use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
 
 pub struct CryptoState {
     static_key: SigningKey,
@@ -36,10 +36,6 @@ impl CryptoState {
 
     pub fn static_public(&self) -> VerifyingKey {
         self.static_key.verifying_key()
-    }
-
-    pub fn node_id(&self) -> [u8; 32] {
-        Sha256::digest(self.static_public().as_bytes()).into()
     }
 
     pub fn sign_handshake(&self, ephemeral_public: &PublicKey) -> Signature {
@@ -76,36 +72,34 @@ impl CryptoState {
         // Protocol 4.2: Key Material Extraction
         // Salt: b"patronus-protocol-v1"
         let hk = Hkdf::<Sha256>::new(Some(b"patronus-protocol-v1"), shared.as_bytes());
-        
+
         // K_enc (Encryption Key): b"session-encryption", 32 bytes
         let mut okm_enc = [0u8; 32];
-        hk.expand(b"session-encryption", &mut okm_enc).map_err(|_| "HKDF expand failed")?;
+        hk.expand(b"session-encryption", &mut okm_enc)
+            .map_err(|_| "HKDF expand failed")?;
         let cipher = Aes256Gcm::new_from_slice(&okm_enc).map_err(|_| "invalid key length")?;
 
         // K_id (Identity Key): b"identity-projection", 3 bytes
         let mut okm_id = [0u8; 3];
-        hk.expand(b"identity-projection", &mut okm_id).map_err(|_| "HKDF expand failed")?;
+        hk.expand(b"identity-projection", &mut okm_id)
+            .map_err(|_| "HKDF expand failed")?;
 
         let code = compute_security_code(&okm_id);
 
         // Topic ID for AAD (could be derived or negotiated, protocol 6.4 says 32 bytes)
         let mut hasher = Sha256::new();
-        let mut keys = [*self.static_public().as_bytes(), *peer_static_public.as_bytes()];
+        let mut keys = [
+            *self.static_public().as_bytes(),
+            *peer_static_public.as_bytes(),
+        ];
         keys.sort();
         hasher.update(keys[0]);
         hasher.update(keys[1]);
         let topic_id: [u8; 32] = hasher.finalize().into();
 
-        self.session = Some(Session {
-            cipher,
-            topic_id,
-        });
+        self.session = Some(Session { cipher, topic_id });
 
         Ok(code)
-    }
-
-    pub fn is_ready(&self) -> bool {
-        self.session.is_some()
     }
 
     fn aad(&self) -> Vec<u8> {
@@ -120,7 +114,7 @@ impl CryptoState {
         let session = self.session.as_ref().expect("handshake not completed");
         let nonce_bytes: [u8; 12] = rand::random();
         let nonce = Nonce::from_slice(&nonce_bytes);
-        
+
         let aad = self.aad();
         let payload = aes_gcm::aead::Payload {
             msg: plaintext,
@@ -140,12 +134,13 @@ impl CryptoState {
 
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, &'static str> {
         let session = self.session.as_ref().ok_or("handshake not completed")?;
-        if data.len() < 12 + 16 { // nonce + tag
+        if data.len() < 12 + 16 {
+            // nonce + tag
             return Err("ciphertext too short");
         }
         let (nonce_bytes, ciphertext) = data.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
-        
+
         let aad = self.aad();
         let payload = aes_gcm::aead::Payload {
             msg: ciphertext,
@@ -162,8 +157,10 @@ impl CryptoState {
 fn compute_security_code(k_id: &[u8; 3]) -> String {
     let wordlists_raw = include_str!("../assets/wordlists.json");
     let wordlists: Value = serde_json::from_str(wordlists_raw).expect("valid json");
-    
-    let adjectives = wordlists["adjectives"].as_array().expect("adjectives array");
+
+    let adjectives = wordlists["adjectives"]
+        .as_array()
+        .expect("adjectives array");
     let colors = wordlists["colors"].as_array().expect("colors array");
     let spirits = wordlists["spirits"].as_array().expect("spirits array");
 
