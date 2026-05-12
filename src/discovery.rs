@@ -85,6 +85,7 @@ impl DiscoveryService {
                     if !is_running.load(Ordering::SeqCst) {
                         break;
                     }
+
                     thread::sleep(Duration::from_millis(100));
                 }
             }
@@ -125,7 +126,6 @@ impl DiscoveryService {
                         if parts.len() == 3 && parts[0] == magic_header {
                             let incoming_node_id = parts[2].to_string();
 
-                            // ignore broadcasts looped back from ourselves
                             if incoming_node_id == self_node_id {
                                 continue;
                             }

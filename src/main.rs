@@ -27,6 +27,8 @@ struct Args {
     name: Option<String>,
     #[arg(short, long)]
     priv_key: Option<String>,
+    #[arg(short, long)]
+    broadcast: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +88,7 @@ async fn main() -> Result<()> {
     let signing_key = SigningKey::from_bytes(ed_sk.private.as_ref());
 
     let closed = Arc::new(Mutex::new(false));
-    let app = App::new();
+    let mut app = App::new();
 
     let (ui_tx, ui_rx) = mpsc::channel(100);
     let (msg_tx, msg_rx) = mpsc::channel::<String>(100);
@@ -105,6 +107,9 @@ async fn main() -> Result<()> {
     });
 
     let discovery = Arc::new(DiscoveryService::new(app_port, local_node_id.to_string()));
+
+    discovery.set_broadcasting(args.broadcast.unwrap_or(true));
+    app.broadcasting = args.broadcast.unwrap_or(true);
 
     let ui_tx_disc = ui_tx.clone();
 
