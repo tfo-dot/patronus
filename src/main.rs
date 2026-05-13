@@ -8,7 +8,9 @@ use anyhow::Result;
 use clap::Parser;
 use discovery::DiscoveryService;
 use ed25519_dalek::SigningKey;
-use ssh_key::{HashAlg, PrivateKey};
+use sha2::{Digest, Sha256};
+use data_encoding::BASE64;
+use ssh_key::PrivateKey;
 use tokio::sync::{Mutex, mpsc};
 
 use ratatui::{
@@ -50,9 +52,12 @@ struct App {
     messages: Vec<(String, String, bool)>, // (Sender, Content, IsSystem)
     peers: HashMap<String, (String, String)>, //(Name, Address)
     peer_ids: Vec<String>,
+    custom_names: HashMap<String, String>,
     selected: usize,
     identity_phrase: Option<String>,
     input: String,
+    rename_input: String,
+    is_renaming: bool,
     broadcasting: bool,
 }
 
@@ -62,10 +67,27 @@ impl App {
             messages: Vec::new(),
             peers: HashMap::new(),
             peer_ids: Vec::new(),
+            custom_names: HashMap::new(),
             selected: 0,
             identity_phrase: None,
             input: String::new(),
+            rename_input: String::new(),
+            is_renaming: false,
             broadcasting: true,
+        }
+    }
+
+    fn get_display_name(&self, id: &str) -> String {
+        if let Some(name) = self.custom_names.get(id) {
+            return name.clone();
+        }
+        if let Some((name, _)) = self.peers.get(id) {
+            return name.clone();
+        }
+        if id.len() > 8 {
+            id.chars().take(8).collect()
+        } else {
+            id.to_string()
         }
     }
 }
@@ -81,11 +103,9 @@ async fn main() -> Result<()> {
     }
     .unwrap();
 
-    let binding = pk.public_key().fingerprint(HashAlg::Sha256).to_string();
-    let local_node_id = binding.strip_prefix("SHA256:").unwrap();
-
     let ed_sk = pk.key_data().ed25519().expect("Ed25519 key required");
     let signing_key = SigningKey::from_bytes(ed_sk.private.as_ref());
+    let local_node_id = BASE64.encode(Sha256::digest(signing_key.verifying_key().as_bytes()).as_slice());
 
     let closed = Arc::new(Mutex::new(false));
     let mut app = App::new();
@@ -149,49 +169,116 @@ async fn run_app(
         if event::poll(Duration::from_millis(10))? {
             if let CrosstermEvent::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Enter => {
-                            if !app.input.is_empty() {
-                                let input = app.input.drain(..).collect::<String>();
-                                if msg_tx.try_send(input.clone()).is_ok() {
-                                    app.messages.push(("Me".to_string(), input, false));
+                    if app.is_renaming {
+                        match key.code {
+                            KeyCode::Enter => {
+                                if !app.rename_input.is_empty() {
+                                    let peer_id = app.peer_ids[app.selected].clone();
+                                    app.custom_names
+                                        .insert(peer_id, app.rename_input.drain(..).collect());
+
+                                    let current_peer_id = app.peer_ids[app.selected].clone();
+                                    app.peer_ids.sort_by(|a, b| {
+                                        let name_a = app
+                                            .custom_names
+                                            .get(a)
+                                            .map(|s| s.as_str())
+                                            .unwrap_or_else(|| {
+                                                app.peers.get(a).map(|p| p.0.as_str()).unwrap_or(a)
+                                            });
+                                        let name_b = app
+                                            .custom_names
+                                            .get(b)
+                                            .map(|s| s.as_str())
+                                            .unwrap_or_else(|| {
+                                                app.peers.get(b).map(|p| p.0.as_str()).unwrap_or(b)
+                                            });
+
+                                        name_a.cmp(name_b)
+                                    });
+                                    app.selected = app
+                                        .peer_ids
+                                        .iter()
+                                        .position(|id| id == &current_peer_id)
+                                        .unwrap_or(0);
                                 }
-                            } else if !app.peer_ids.is_empty() {
-                                let peer_id = &app.peer_ids[app.selected];
-                                if let Some((_, addr)) = app.peers.get(peer_id) {
-                                    let _ = connect_tx.try_send(addr.clone());
+                                app.is_renaming = false;
+                            }
+                            KeyCode::Esc => {
+                                app.is_renaming = false;
+                                app.rename_input.clear();
+                            }
+                            KeyCode::Char(c) => {
+                                app.rename_input.push(c);
+                            }
+                            KeyCode::Backspace => {
+                                app.rename_input.pop();
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Enter => {
+                                if !app.input.is_empty() {
+                                    let input = app.input.drain(..).collect::<String>();
+                                    if msg_tx.try_send(input.clone()).is_ok() {
+                                        app.messages.push(("Me".to_string(), input, false));
+                                    }
+                                } else if !app.peer_ids.is_empty() {
+                                    let peer_id = &app.peer_ids[app.selected];
+                                    if let Some((name, addr)) = app.peers.get(peer_id) {
+                                        let display_name =
+                                            app.custom_names.get(peer_id).unwrap_or(name);
+                                        app.messages.push((
+                                            "System".to_string(),
+                                            format!("Connecting to {}...", display_name),
+                                            true,
+                                        ));
+                                        let _ = connect_tx.try_send(addr.clone());
+                                    }
                                 }
                             }
-                        }
-                        KeyCode::Up => {
-                            if !app.peer_ids.is_empty() {
-                                app.selected = if app.selected > 0 {
-                                    app.selected - 1
-                                } else {
-                                    app.peer_ids.len() - 1
+                            KeyCode::Up => {
+                                if !app.peer_ids.is_empty() {
+                                    app.selected = if app.selected > 0 {
+                                        app.selected - 1
+                                    } else {
+                                        app.peer_ids.len() - 1
+                                    }
                                 }
                             }
-                        }
-                        KeyCode::Down => {
-                            if !app.peer_ids.is_empty() {
-                                app.selected = (app.selected + 1) % app.peer_ids.len();
+                            KeyCode::Down => {
+                                if !app.peer_ids.is_empty() {
+                                    app.selected = (app.selected + 1) % app.peer_ids.len();
+                                }
                             }
+                            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let new_state = !discovery.is_broadcasting();
+                                discovery.set_broadcasting(new_state);
+                                app.broadcasting = new_state;
+                            }
+                            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                if !app.peer_ids.is_empty() {
+                                    app.is_renaming = true;
+                                    let peer_id = &app.peer_ids[app.selected];
+                                    app.rename_input = app
+                                        .custom_names
+                                        .get(peer_id)
+                                        .cloned()
+                                        .unwrap_or_else(|| app.peers.get(peer_id).unwrap().0.clone());
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                app.input.push(c);
+                            }
+                            KeyCode::Backspace => {
+                                app.input.pop();
+                            }
+                            KeyCode::Esc => {
+                                return Ok(());
+                            }
+                            _ => {}
                         }
-                        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let new_state = !discovery.is_broadcasting();
-                            discovery.set_broadcasting(new_state);
-                            app.broadcasting = new_state;
-                        }
-                        KeyCode::Char(c) => {
-                            app.input.push(c);
-                        }
-                        KeyCode::Backspace => {
-                            app.input.pop();
-                        }
-                        KeyCode::Esc => {
-                            return Ok(());
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -201,9 +288,30 @@ async fn run_app(
             match event {
                 UiEvent::Message {
                     from,
-                    text,
+                    mut text,
                     is_system,
                 } => {
+                    if is_system {
+                        if text.starts_with("Connected to ") {
+                            let id = text.strip_prefix("Connected to ").unwrap();
+                            text = format!("Connected to {}", app.get_display_name(id));
+                        } else if text.starts_with("Connection lost with ") {
+                            let parts: Vec<&str> = text
+                                .strip_prefix("Connection lost with ")
+                                .unwrap()
+                                .splitn(2, ": ")
+                                .collect();
+                            if parts.len() == 2 {
+                                let id = parts[0];
+                                let err = parts[1];
+                                text = format!(
+                                    "Connection lost with {}: {}",
+                                    app.get_display_name(id),
+                                    err
+                                );
+                            }
+                        }
+                    }
                     app.messages.push((from, text, is_system));
                 }
                 UiEvent::HandshakeComplete(code) => {
@@ -213,8 +321,16 @@ async fn run_app(
                     if !app.peers.contains_key(&id) {
                         app.peer_ids.push(id.clone());
                         app.peer_ids.sort_by(|a, b| {
-                            let name_a = &app.peers.get(a).map(|p| p.0.as_str()).unwrap_or(a);
-                            let name_b = &app.peers.get(b).map(|p| p.0.as_str()).unwrap_or(b);
+                            let name_a = app
+                                .custom_names
+                                .get(a)
+                                .map(|s| s.as_str())
+                                .unwrap_or_else(|| app.peers.get(a).map(|p| p.0.as_str()).unwrap_or(a));
+                            let name_b = app
+                                .custom_names
+                                .get(b)
+                                .map(|s| s.as_str())
+                                .unwrap_or_else(|| app.peers.get(b).map(|p| p.0.as_str()).unwrap_or(b));
 
                             name_a.cmp(name_b)
                         });
@@ -240,7 +356,7 @@ async fn run_network(
     loop {
         tokio::select! {
             incoming = listener.accept() => {
-                if let Ok((mut stream, _)) = incoming {
+                if let Ok((mut stream, addr)) = incoming {
                     if let Err(e) = client.handshake(&mut stream).await {
                         let _ = ui_tx.try_send(UiEvent::Message{
                             from: "System".to_string(),
@@ -249,6 +365,14 @@ async fn run_network(
                         });
 
                         continue;
+                    }
+
+                    if let Some(id) = &client.peer_node_id {
+                        let _ = ui_tx.try_send(UiEvent::PeerUpdate {
+                            id: id.clone(),
+                            name: id.chars().take(8).collect(),
+                            addr: addr.to_string(),
+                        });
                     }
 
                     if let Some(phrase) = &client.identity_phrase {
@@ -271,6 +395,14 @@ async fn run_network(
                                     }).await;
 
                                     continue;
+                                }
+
+                                if let Some(id) = &client.peer_node_id {
+                                    let _ = ui_tx.try_send(UiEvent::PeerUpdate {
+                                        id: id.clone(),
+                                        name: id.chars().take(8).collect(),
+                                        addr: addr.clone(),
+                                    });
                                 }
 
                                 if let Some(phrase) = &client.identity_phrase {
@@ -302,10 +434,15 @@ async fn handle_connection<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    let peer_id = client
+        .peer_node_id
+        .clone()
+        .unwrap_or_else(|| "Unknown".to_string());
+
     let _ = ui_tx
         .send(UiEvent::Message {
             from: "System".to_string(),
-            text: "Connect to peer".to_string(),
+            text: format!("Connected to {}", peer_id),
             is_system: true,
         })
         .await;
@@ -325,7 +462,7 @@ where
                         let json: serde_json::Value = serde_json::from_slice(&payload)?;
                         if let Some(text) = json["text"].as_str() {
                             let _ = ui_tx.send(UiEvent::Message {
-                                from: "Peer".to_string(),
+                                from: peer_id.clone(),
                                 text: text.to_string(),
                                 is_system: false,
                             }).await;
@@ -341,7 +478,7 @@ where
                     Err(e) => {
                         let _ = ui_tx.send(UiEvent::Message {
                             from: "System".to_string(),
-                            text: format!("Connection lost {}", e),
+                            text: format!("Connection lost with {}: {}", peer_id, e),
                             is_system: true
                         }).await;
 
@@ -401,7 +538,7 @@ fn render(f: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, id)| {
-            let (name, _addr): &(String, String) = app.peers.get(id).unwrap();
+            let display_name = app.get_display_name(id);
             let style = if i == app.selected {
                 Style::default().fg(Color::Black).bg(Color::Yellow)
             } else {
@@ -409,7 +546,7 @@ fn render(f: &mut Frame, app: &App) {
             };
 
             ListItem::new(Line::from(vec![
-                Span::styled(name.as_str(), style),
+                Span::styled(display_name, style),
                 Span::raw(" ("),
                 Span::styled(id, Style::default().fg(Color::DarkGray)),
                 Span::raw(")"),
@@ -440,7 +577,14 @@ fn render(f: &mut Frame, app: &App) {
                 Style::default().fg(Color::Yellow)
             };
 
-            let header = Span::styled(format!("{}: ", from), style.add_modifier(Modifier::BOLD));
+            let display_from = if *is_system || from == "Me" {
+                from.clone()
+            } else {
+                app.get_display_name(from)
+            };
+
+            let header =
+                Span::styled(format!("{}: ", display_from), style.add_modifier(Modifier::BOLD));
             let body = Span::raw(content);
             ListItem::new(Line::from(vec![header, body]))
         })
@@ -453,7 +597,38 @@ fn render(f: &mut Frame, app: &App) {
     let input = Paragraph::new(app.input.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Message (Esc to quit, Ctrl+B to toggle broadcast)"),
+            .title("Message (Esc to quit, Ctrl+B to toggle broadcast, Ctrl+R to rename peer)"),
     );
     f.render_widget(input, main_layout[2]);
+
+    if app.is_renaming {
+        let block = Block::default()
+            .title("Rename Peer")
+            .borders(Borders::ALL)
+            .style(Style::default().bg(Color::Blue));
+        let area = centered_rect(60, 20, f.area());
+        f.render_widget(ratatui::widgets::Clear, area); //this clears out the background
+        let input = Paragraph::new(app.rename_input.as_str()).block(block);
+        f.render_widget(input, area);
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
