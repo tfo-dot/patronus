@@ -151,24 +151,30 @@ impl CryptoState {
 
     pub fn decrypt(&mut self, data: &[u8], remote_ratchet: u32) -> Result<Vec<u8>, &'static str> {
         let session = self.session.as_mut().ok_or("handshake not completed")?;
-        let aad = Self::compute_aad(&session.topic_id);
 
         if remote_ratchet <= session.ratchet_recv {
             return Err("stale or replayed ratchet index");
         }
 
-        // Catch up to remote ratchet
-        while session.ratchet_recv < remote_ratchet {
-            session.k_enc = Self::advance_key(&session.k_enc);
-            session.ratchet_recv += 1;
+        let steps = remote_ratchet - session.ratchet_recv;
+
+        if steps > 50 {
+            return Err("ratched index jumped too far ahead");
         }
 
-        let cipher = Aes256Gcm::new_from_slice(&session.k_enc).map_err(|_| "invalid key length")?;
+        let mut temp_key = session.k_enc;
+        for _ in 0..steps {
+            temp_key = Self::advance_key(&temp_key)
+        }
+
+        let aad = Self::compute_aad(&session.topic_id);
+        let cipher = Aes256Gcm::new_from_slice(&temp_key).map_err(|_| "invalid key length")?;
 
         if data.len() < 12 + 16 {
             // nonce + tag
             return Err("ciphertext too short");
         }
+
         let (nonce_bytes, ciphertext) = data.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
 
@@ -177,9 +183,14 @@ impl CryptoState {
             aad: &aad,
         };
 
-        cipher
+        let decrypted = cipher
             .decrypt(nonce, payload)
-            .map_err(|_| "decryption failed")
+            .map_err(|_| "decryption failed")?;
+
+        session.k_enc = temp_key;
+        session.ratchet_recv = remote_ratchet;
+
+        Ok(decrypted)
     }
 }
 
