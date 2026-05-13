@@ -6,13 +6,13 @@ use std::{collections::HashMap, fs, path::Path, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;
+use data_encoding::BASE64;
 use directories::ProjectDirs;
 use discovery::DiscoveryService;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use ssh_key::{HashAlg, PrivateKey, LineEnding};
+use ssh_key::{LineEnding, PrivateKey};
 use sha2::{Digest, Sha256};
-use data_encoding::BASE64;
 use tokio::sync::{Mutex, mpsc};
 
 use ratatui::{
@@ -135,7 +135,8 @@ async fn main() -> Result<()> {
 
     let ed_sk = pk.key_data().ed25519().expect("Ed25519 key required");
     let signing_key = SigningKey::from_bytes(ed_sk.private.as_ref());
-    let local_node_id = BASE64.encode(Sha256::digest(signing_key.verifying_key().as_bytes()).as_slice());
+    let local_node_id =
+        BASE64.encode(Sha256::digest(signing_key.verifying_key().as_bytes()).as_slice());
 
     let closed = Arc::new(Mutex::new(false));
     let mut app = App::new();
@@ -291,11 +292,10 @@ async fn run_app(
                                 if !app.peer_ids.is_empty() {
                                     app.is_renaming = true;
                                     let peer_id = &app.peer_ids[app.selected];
-                                    app.rename_input = app
-                                        .custom_names
-                                        .get(peer_id)
-                                        .cloned()
-                                        .unwrap_or_else(|| app.peers.get(peer_id).unwrap().0.clone());
+                                    app.rename_input =
+                                        app.custom_names.get(peer_id).cloned().unwrap_or_else(
+                                            || app.peers.get(peer_id).unwrap().0.clone(),
+                                        );
                                 }
                             }
                             KeyCode::Char(c) => {
@@ -355,12 +355,16 @@ async fn run_app(
                                 .custom_names
                                 .get(a)
                                 .map(|s| s.as_str())
-                                .unwrap_or_else(|| app.peers.get(a).map(|p| p.0.as_str()).unwrap_or(a));
+                                .unwrap_or_else(|| {
+                                    app.peers.get(a).map(|p| p.0.as_str()).unwrap_or(a)
+                                });
                             let name_b = app
                                 .custom_names
                                 .get(b)
                                 .map(|s| s.as_str())
-                                .unwrap_or_else(|| app.peers.get(b).map(|p| p.0.as_str()).unwrap_or(b));
+                                .unwrap_or_else(|| {
+                                    app.peers.get(b).map(|p| p.0.as_str()).unwrap_or(b)
+                                });
 
                             name_a.cmp(name_b)
                         });
@@ -387,7 +391,7 @@ async fn run_network(
         tokio::select! {
             incoming = listener.accept() => {
                 if let Ok((mut stream, addr)) = incoming {
-                    if let Err(e) = client.handshake(&mut stream).await {
+                    if let Err(e) = client.handshake(&mut stream, false).await {
                         let _ = ui_tx.try_send(UiEvent::Message{
                             from: "System".to_string(),
                             text: format!("Inbound handshake failed {}", e),
@@ -405,6 +409,17 @@ async fn run_network(
                         });
                     }
 
+                    let our_exts = client::SUPPORTED_EXTENSIONS.join(", ");
+                    let peer_exts = client.peer_extensions.join(", ");
+                    let _ = ui_tx.send(UiEvent::Message {
+                        from: "System".to_string(),
+                        text: format!(
+                            "Connection established! Our extensions: [{}]. Peer extensions: [{}]",
+                            our_exts, peer_exts
+                        ),
+                        is_system: true,
+                    }).await;
+
                     if let Some(phrase) = &client.identity_phrase {
                         let _ = ui_tx.send(UiEvent::HandshakeComplete(phrase.clone())).await;
                     }
@@ -417,7 +432,7 @@ async fn run_network(
                     if let Some(addr) = outgoing_addr {
                         match tokio::net::TcpStream::connect(&addr).await {
                             Ok(mut stream) => {
-                                if let Err(e) = client.handshake(&mut stream).await {
+                                if let Err(e) = client.handshake(&mut stream, true).await {
                                     let _ = ui_tx.send(UiEvent::Message{
                                         from: "System".to_string(),
                                         text: format!("Outbound handshake failed {}", e),
@@ -434,6 +449,17 @@ async fn run_network(
                                         addr: addr.clone(),
                                     });
                                 }
+
+                                let our_exts = client::SUPPORTED_EXTENSIONS.join(", ");
+                                let peer_exts = client.peer_extensions.join(", ");
+                                let _ = ui_tx.send(UiEvent::Message {
+                                    from: "System".to_string(),
+                                    text: format!(
+                                        "Connection established! Our extensions: [{}]. Peer extensions: [{}]",
+                                        our_exts, peer_exts
+                                    ),
+                                    is_system: true,
+                                }).await;
 
                                 if let Some(phrase) = &client.identity_phrase {
                         let _ = ui_tx.send(UiEvent::HandshakeComplete(phrase.clone())).await;
@@ -613,8 +639,10 @@ fn render(f: &mut Frame, app: &App) {
                 app.get_display_name(from)
             };
 
-            let header =
-                Span::styled(format!("{}: ", display_from), style.add_modifier(Modifier::BOLD));
+            let header = Span::styled(
+                format!("{}: ", display_from),
+                style.add_modifier(Modifier::BOLD),
+            );
             let body = Span::raw(content);
             ListItem::new(Line::from(vec![header, body]))
         })
@@ -643,7 +671,11 @@ fn render(f: &mut Frame, app: &App) {
     }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: ratatui::layout::Rect) -> ratatui::layout::Rect {
+fn centered_rect(
+    percent_x: u16,
+    percent_y: u16,
+    r: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

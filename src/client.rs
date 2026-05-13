@@ -10,6 +10,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::bytes::BufMut;
 use x25519_dalek::PublicKey;
 
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["compression:zstd", "ratchet:v1"];
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HandshakePacket {
     #[serde(rename = "type")]
@@ -25,6 +27,8 @@ pub struct PatronusClient {
     pub peer_node_id: Option<String>,
     pub identity_phrase: Option<String>,
     pub selected_compression: Option<String>,
+    pub active_extensions: Vec<String>,
+    pub peer_extensions: Vec<String>,
 }
 
 impl PatronusClient {
@@ -34,10 +38,12 @@ impl PatronusClient {
             peer_node_id: None,
             identity_phrase: None,
             selected_compression: None,
+            active_extensions: Vec::new(),
+            peer_extensions: Vec::new(),
         }
     }
 
-    pub async fn handshake<S>(&mut self, stream: &mut S) -> Result<()>
+    pub async fn handshake<S>(&mut self, stream: &mut S, is_initiator: bool) -> Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
@@ -51,7 +57,7 @@ impl PatronusClient {
             pk: BASE64.encode(ephemeral_pk.as_bytes()),
             spk: BASE64.encode(spk.as_bytes()),
             sig: BASE64.encode(sig.to_bytes().as_slice()),
-            extensions: vec!["compression:zstd".to_string()],
+            extensions: SUPPORTED_EXTENSIONS.iter().map(|s| s.to_string()).collect(),
         };
 
         let handshake_json = serde_json::to_vec(&handshake)?;
@@ -66,6 +72,7 @@ impl PatronusClient {
         stream.read_exact(&mut peer_handshake_buf).await?;
 
         let peer_handshake: HandshakePacket = serde_json::from_slice(&peer_handshake_buf)?;
+        self.peer_extensions = peer_handshake.extensions.clone();
 
         // Verify peer handshake
         let peer_ephemeral_pk_bytes = BASE64.decode(peer_handshake.pk.as_bytes())?;
@@ -95,16 +102,33 @@ impl PatronusClient {
             return Err(anyhow!("Handshake signature verification failed"));
         }
 
-        // Negotiation (7.5.2)
-        self.selected_compression = peer_handshake
-            .extensions
+        // Negotiation (7.5.1 & 7.5.2)
+        let my_extensions = &handshake.extensions;
+        let peer_extensions = &peer_handshake.extensions;
+
+        let (initiator_exts, responder_exts) = if is_initiator {
+            (my_extensions, peer_extensions)
+        } else {
+            (peer_extensions, my_extensions)
+        };
+
+        // Find the first compression algorithm in initiator's list that is also in responder's list
+        self.selected_compression = initiator_exts
             .iter()
-            .find(|ext| ext.starts_with("compression:zstd"))
-            .map(|ext| ext.to_string());
+            .filter(|ext| ext.starts_with("compression:"))
+            .find(|ext| responder_exts.contains(ext))
+            .cloned();
 
         if self.selected_compression.is_none() {
-            return Err(anyhow!("No common compression algorithm"));
+            return Err(anyhow!("Handshake Failed (0x01): No common compression algorithm"));
         }
+
+        // Track all agreed extensions
+        self.active_extensions = my_extensions
+            .iter()
+            .filter(|ext| peer_extensions.contains(ext))
+            .cloned()
+            .collect();
 
         // Complete handshake
         let phrase = self
@@ -159,8 +183,11 @@ impl PatronusClient {
         plaintext.push(msg_type);
         plaintext.extend_from_slice(payload);
 
-        // Section 7.5.2: Compression (zstd)
-        let compressed = zstd::encode_all(Cursor::new(plaintext), 3)?;
+        // Section 7.5.2: Compression
+        let compressed = match self.selected_compression.as_deref() {
+            Some("compression:zstd") => zstd::encode_all(Cursor::new(plaintext), 3)?,
+            _ => plaintext, // Default to no compression if something is weird, though handshake should prevent this
+        };
 
         // Section 6.2: Encrypted Message Frame + Section 7.1: Ratchet Index
         let (encrypted, ratchet_index) = self.crypto.encrypt(&compressed);
@@ -209,7 +236,12 @@ impl PatronusClient {
 
         // Decompress
         let mut decompressed = Vec::new();
-        zstd::Decoder::new(Cursor::new(decrypted))?.read_to_end(&mut decompressed)?;
+        match self.selected_compression.as_deref() {
+            Some("compression:zstd") => {
+                zstd::Decoder::new(Cursor::new(decrypted))?.read_to_end(&mut decompressed)?;
+            }
+            _ => decompressed = decrypted,
+        }
 
         if decompressed.is_empty() {
             return Err(anyhow!("Empty payload after decompression"));
