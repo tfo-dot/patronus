@@ -409,7 +409,7 @@ async fn run_network(
                         let _ = ui_tx.send(UiEvent::HandshakeComplete(phrase.clone())).await;
                     }
 
-                    handle_connection(&client, stream, ui_tx.clone(), &mut msg_rx).await?;
+                    handle_connection(&mut client, stream, ui_tx.clone(), &mut msg_rx).await?;
                 }
             }
 
@@ -439,7 +439,7 @@ async fn run_network(
                         let _ = ui_tx.send(UiEvent::HandshakeComplete(phrase.clone())).await;
                     }
 
-                    handle_connection(&client, stream, ui_tx.clone(), &mut msg_rx).await?;
+                    handle_connection(&mut client, stream, ui_tx.clone(), &mut msg_rx).await?;
                             }
                             Err(e) => {
                                 let _ = ui_tx.send(UiEvent::Message{
@@ -456,7 +456,7 @@ async fn run_network(
 }
 
 async fn handle_connection<S>(
-    client: &client::PatronusClient,
+    client: &mut client::PatronusClient,
     mut stream: S,
     ui_tx: mpsc::Sender<UiEvent>,
     msg_rx: &mut mpsc::Receiver<String>,

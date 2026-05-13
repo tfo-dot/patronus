@@ -17,8 +17,10 @@ pub struct CryptoState {
 }
 
 struct Session {
-    cipher: Aes256Gcm,
+    k_enc: [u8; 32],
     topic_id: [u8; 32],
+    ratchet_send: u32,
+    ratchet_recv: u32,
 }
 
 impl CryptoState {
@@ -77,7 +79,6 @@ impl CryptoState {
         let mut okm_enc = [0u8; 32];
         hk.expand(b"session-encryption", &mut okm_enc)
             .map_err(|_| "HKDF expand failed")?;
-        let cipher = Aes256Gcm::new_from_slice(&okm_enc).map_err(|_| "invalid key length")?;
 
         // K_id (Identity Key): b"identity-projection", 3 bytes
         let mut okm_id = [0u8; 3];
@@ -97,43 +98,73 @@ impl CryptoState {
         hasher.update(keys[1]);
         let topic_id: [u8; 32] = hasher.finalize().into();
 
-        self.session = Some(Session { cipher, topic_id });
+        self.session = Some(Session {
+            k_enc: okm_enc,
+            topic_id,
+            ratchet_send: 0,
+            ratchet_recv: 0,
+        });
 
         Ok(code)
     }
 
-    fn aad(&self) -> Vec<u8> {
-        let session = self.session.as_ref().expect("handshake not completed");
+    fn advance_key(k_enc: &[u8; 32]) -> [u8; 32] {
+        let hk = Hkdf::<Sha256>::new(None, k_enc);
+        let mut next_k_enc = [0u8; 32];
+        hk.expand(b"time-turner-ratchet", &mut next_k_enc)
+            .expect("HKDF expand failed");
+        next_k_enc
+    }
+
+    fn compute_aad(topic_id: &[u8; 32]) -> Vec<u8> {
         let mut aad = Vec::new();
         aad.extend_from_slice(b"patronus/1.0");
-        aad.extend_from_slice(&session.topic_id);
+        aad.extend_from_slice(topic_id);
         aad
     }
 
-    pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
-        let session = self.session.as_ref().expect("handshake not completed");
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> (Vec<u8>, u32) {
+        let session = self.session.as_mut().expect("handshake not completed");
+        let aad = Self::compute_aad(&session.topic_id);
+
+        // Advance ratchet
+        session.ratchet_send += 1;
+        session.k_enc = Self::advance_key(&session.k_enc);
+
+        let cipher = Aes256Gcm::new_from_slice(&session.k_enc).expect("invalid key length");
+
         let nonce_bytes: [u8; 12] = rand::random();
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let aad = self.aad();
         let payload = aes_gcm::aead::Payload {
             msg: plaintext,
             aad: &aad,
         };
 
-        let ciphertext = session
-            .cipher
-            .encrypt(nonce, payload)
-            .expect("encryption failed");
+        let ciphertext = cipher.encrypt(nonce, payload).expect("encryption failed");
 
         let mut out = Vec::with_capacity(12 + ciphertext.len());
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
-        out
+        (out, session.ratchet_send)
     }
 
-    pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, &'static str> {
-        let session = self.session.as_ref().ok_or("handshake not completed")?;
+    pub fn decrypt(&mut self, data: &[u8], remote_ratchet: u32) -> Result<Vec<u8>, &'static str> {
+        let session = self.session.as_mut().ok_or("handshake not completed")?;
+        let aad = Self::compute_aad(&session.topic_id);
+
+        if remote_ratchet <= session.ratchet_recv {
+            return Err("stale or replayed ratchet index");
+        }
+
+        // Catch up to remote ratchet
+        while session.ratchet_recv < remote_ratchet {
+            session.k_enc = Self::advance_key(&session.k_enc);
+            session.ratchet_recv += 1;
+        }
+
+        let cipher = Aes256Gcm::new_from_slice(&session.k_enc).map_err(|_| "invalid key length")?;
+
         if data.len() < 12 + 16 {
             // nonce + tag
             return Err("ciphertext too short");
@@ -141,14 +172,12 @@ impl CryptoState {
         let (nonce_bytes, ciphertext) = data.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
 
-        let aad = self.aad();
         let payload = aes_gcm::aead::Payload {
             msg: ciphertext,
             aad: &aad,
         };
 
-        session
-            .cipher
+        cipher
             .decrypt(nonce, payload)
             .map_err(|_| "decryption failed")
     }
