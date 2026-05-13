@@ -2,13 +2,15 @@ mod client;
 mod crypto;
 mod discovery;
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, fs, path::Path, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;
+use directories::ProjectDirs;
 use discovery::DiscoveryService;
 use ed25519_dalek::SigningKey;
-use ssh_key::{HashAlg, PrivateKey};
+use rand::rngs::OsRng;
+use ssh_key::{HashAlg, PrivateKey, LineEnding};
 use tokio::sync::{Mutex, mpsc};
 
 use ratatui::{
@@ -77,7 +79,35 @@ async fn main() -> Result<()> {
 
     let pk = match args.priv_key {
         Some(p) => PrivateKey::read_openssh_file(Path::new(&p)),
-        None => PrivateKey::from_openssh(include_str!("../keys/one")),
+        None => {
+            let pd = ProjectDirs::from("com", "patronus", "patronus")
+                .expect("No valid user OS profile found");
+
+            let cd = pd.config_dir();
+
+            if !cd.exists() {
+                fs::create_dir_all(cd).expect("Couldn't create config directory")
+            }
+
+            let fp = pd.config_dir().join("key");
+
+            if fp.exists() {
+                PrivateKey::read_openssh_file(&fp)
+            } else {
+                let pk = PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+
+                #[cfg(windows)]
+                let line_ending = LineEnding::CRLF;
+
+                #[cfg(not(windows))]
+                let line_ending = LineEnding::LF;
+
+                PrivateKey::write_openssh_file(&pk, &fp, line_ending)
+                    .expect("Error writing new random key");
+
+                Ok(pk)
+            }
+        }
     }
     .unwrap();
 
