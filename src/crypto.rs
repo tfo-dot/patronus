@@ -17,7 +17,8 @@ pub struct CryptoState {
 }
 
 struct Session {
-    k_enc: [u8; 32],
+    k_recv: [u8; 32],
+    k_send: [u8; 32],
     topic_id: [u8; 32],
     ratchet_send: u32,
     ratchet_recv: u32,
@@ -63,6 +64,7 @@ impl CryptoState {
         &mut self,
         peer_ephemeral_public: &PublicKey,
         peer_static_public: &VerifyingKey,
+        is_initiator: bool,
     ) -> Result<String, &'static str> {
         let secret = self
             .ephemeral_secret
@@ -76,9 +78,20 @@ impl CryptoState {
         let hk = Hkdf::<Sha256>::new(Some(b"patronus-protocol-v1"), shared.as_bytes());
 
         // K_enc (Encryption Key): b"session-encryption", 32 bytes
-        let mut okm_enc = [0u8; 32];
-        hk.expand(b"session-encryption", &mut okm_enc)
+        let mut okm_enc_recv = [0u8; 32];
+        hk.expand(b"session-encryption-i2r", &mut okm_enc_recv)
             .map_err(|_| "HKDF expand failed")?;
+
+        // K_enc (Encryption Key): b"session-encryption", 32 bytes
+        let mut okm_enc_send = [0u8; 32];
+        hk.expand(b"ssession-encryption-r2i", &mut okm_enc_send)
+            .map_err(|_| "HKDF expand failed")?;
+
+        let (okm_enc_recv, okm_enc_send) = if is_initiator {
+            (okm_enc_send, okm_enc_recv)
+        } else {
+            (okm_enc_recv, okm_enc_send)
+        };
 
         // K_id (Identity Key): b"identity-projection", 3 bytes
         let mut okm_id = [0u8; 3];
@@ -99,7 +112,8 @@ impl CryptoState {
         let topic_id: [u8; 32] = hasher.finalize().into();
 
         self.session = Some(Session {
-            k_enc: okm_enc,
+            k_recv: okm_enc_recv,
+            k_send: okm_enc_send,
             topic_id,
             ratchet_send: 0,
             ratchet_recv: 0,
@@ -129,9 +143,9 @@ impl CryptoState {
 
         // Advance ratchet
         session.ratchet_send += 1;
-        session.k_enc = Self::advance_key(&session.k_enc);
+        session.k_send = Self::advance_key(&session.k_send);
 
-        let cipher = Aes256Gcm::new_from_slice(&session.k_enc).expect("invalid key length");
+        let cipher = Aes256Gcm::new_from_slice(&session.k_send).expect("invalid key length");
 
         let nonce_bytes: [u8; 12] = rand::random();
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -162,7 +176,7 @@ impl CryptoState {
             return Err("ratched index jumped too far ahead");
         }
 
-        let mut temp_key = session.k_enc;
+        let mut temp_key = session.k_recv;
         for _ in 0..steps {
             temp_key = Self::advance_key(&temp_key)
         }
@@ -187,7 +201,7 @@ impl CryptoState {
             .decrypt(nonce, payload)
             .map_err(|_| "decryption failed")?;
 
-        session.k_enc = temp_key;
+        session.k_recv = temp_key;
         session.ratchet_recv = remote_ratchet;
 
         Ok(decrypted)

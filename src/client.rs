@@ -133,7 +133,7 @@ impl PatronusClient {
         // Complete handshake
         let phrase = self
             .crypto
-            .complete_handshake(&peer_ephemeral_pk, &peer_static_pk)
+            .complete_handshake(&peer_ephemeral_pk, &peer_static_pk, is_initiator)
             .map_err(|e| anyhow!(e))?;
 
         self.identity_phrase = Some(phrase);

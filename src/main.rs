@@ -83,9 +83,11 @@ impl App {
         if let Some(name) = self.custom_names.get(id) {
             return name.clone();
         }
+
         if let Some((name, _)) = self.peers.get(id) {
             return name.clone();
         }
+
         if id.len() > 8 {
             id.chars().take(8).collect()
         } else {
@@ -97,7 +99,6 @@ impl App {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let _name = args.name.unwrap_or_else(|| "Anonymous".to_string());
 
     let pk = match args.priv_key {
         Some(p) => PrivateKey::read_openssh_file(Path::new(&p)),
@@ -561,11 +562,13 @@ fn render(f: &mut Frame, app: &App) {
         .identity_phrase
         .as_deref()
         .unwrap_or("Waiting for handshake...");
+        
     let (broadcast_label, broadcast_color) = if app.broadcasting {
         ("ON", Color::Green)
     } else {
         ("OFF", Color::Red)
     };
+
     let info_text = vec![Line::from(vec![
         Span::styled("Identity: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(identity, Style::default().fg(Color::Cyan)),
