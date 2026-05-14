@@ -17,8 +17,11 @@ pub struct CryptoState {
 }
 
 struct Session {
-    cipher: Aes256Gcm,
+    k_recv: [u8; 32],
+    k_send: [u8; 32],
     topic_id: [u8; 32],
+    ratchet_send: u32,
+    ratchet_recv: u32,
 }
 
 impl CryptoState {
@@ -61,6 +64,7 @@ impl CryptoState {
         &mut self,
         peer_ephemeral_public: &PublicKey,
         peer_static_public: &VerifyingKey,
+        is_initiator: bool,
     ) -> Result<String, &'static str> {
         let secret = self
             .ephemeral_secret
@@ -74,10 +78,20 @@ impl CryptoState {
         let hk = Hkdf::<Sha256>::new(Some(b"patronus-protocol-v1"), shared.as_bytes());
 
         // K_enc (Encryption Key): b"session-encryption", 32 bytes
-        let mut okm_enc = [0u8; 32];
-        hk.expand(b"session-encryption", &mut okm_enc)
+        let mut okm_enc_recv = [0u8; 32];
+        hk.expand(b"session-encryption-i2r", &mut okm_enc_recv)
             .map_err(|_| "HKDF expand failed")?;
-        let cipher = Aes256Gcm::new_from_slice(&okm_enc).map_err(|_| "invalid key length")?;
+
+        // K_enc (Encryption Key): b"session-encryption", 32 bytes
+        let mut okm_enc_send = [0u8; 32];
+        hk.expand(b"session-encryption-r2i", &mut okm_enc_send)
+            .map_err(|_| "HKDF expand failed")?;
+
+        let (okm_enc_recv, okm_enc_send) = if is_initiator {
+            (okm_enc_send, okm_enc_recv)
+        } else {
+            (okm_enc_recv, okm_enc_send)
+        };
 
         // K_id (Identity Key): b"identity-projection", 3 bytes
         let mut okm_id = [0u8; 3];
@@ -97,60 +111,100 @@ impl CryptoState {
         hasher.update(keys[1]);
         let topic_id: [u8; 32] = hasher.finalize().into();
 
-        self.session = Some(Session { cipher, topic_id });
+        self.session = Some(Session {
+            k_recv: okm_enc_recv,
+            k_send: okm_enc_send,
+            topic_id,
+            ratchet_send: 0,
+            ratchet_recv: 0,
+        });
 
         Ok(code)
     }
 
-    fn aad(&self) -> Vec<u8> {
-        let session = self.session.as_ref().expect("handshake not completed");
+    fn advance_key(k_enc: &[u8; 32]) -> [u8; 32] {
+        let hk = Hkdf::<Sha256>::new(None, k_enc);
+        let mut next_k_enc = [0u8; 32];
+        hk.expand(b"time-turner-ratchet", &mut next_k_enc)
+            .expect("HKDF expand failed");
+        next_k_enc
+    }
+
+    fn compute_aad(topic_id: &[u8; 32]) -> Vec<u8> {
         let mut aad = Vec::new();
         aad.extend_from_slice(b"patronus/1.0");
-        aad.extend_from_slice(&session.topic_id);
+        aad.extend_from_slice(topic_id);
         aad
     }
 
-    pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
-        let session = self.session.as_ref().expect("handshake not completed");
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> (Vec<u8>, u32) {
+        let session = self.session.as_mut().expect("handshake not completed");
+        let aad = Self::compute_aad(&session.topic_id);
+
+        // Advance ratchet
+        session.ratchet_send += 1;
+        session.k_send = Self::advance_key(&session.k_send);
+
+        let cipher = Aes256Gcm::new_from_slice(&session.k_send).expect("invalid key length");
+
         let nonce_bytes: [u8; 12] = rand::random();
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let aad = self.aad();
         let payload = aes_gcm::aead::Payload {
             msg: plaintext,
             aad: &aad,
         };
 
-        let ciphertext = session
-            .cipher
-            .encrypt(nonce, payload)
-            .expect("encryption failed");
+        let ciphertext = cipher.encrypt(nonce, payload).expect("encryption failed");
 
         let mut out = Vec::with_capacity(12 + ciphertext.len());
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
-        out
+        (out, session.ratchet_send)
     }
 
-    pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, &'static str> {
-        let session = self.session.as_ref().ok_or("handshake not completed")?;
+    pub fn decrypt(&mut self, data: &[u8], remote_ratchet: u32) -> Result<Vec<u8>, &'static str> {
+        let session = self.session.as_mut().ok_or("handshake not completed")?;
+
+        if remote_ratchet <= session.ratchet_recv {
+            return Err("stale or replayed ratchet index");
+        }
+
+        let steps = remote_ratchet - session.ratchet_recv;
+
+        if steps > 50 {
+            return Err("ratchet index jumped too far ahead");
+        }
+
+        let mut temp_key = session.k_recv;
+        for _ in 0..steps {
+            temp_key = Self::advance_key(&temp_key)
+        }
+
+        let aad = Self::compute_aad(&session.topic_id);
+        let cipher = Aes256Gcm::new_from_slice(&temp_key).map_err(|_| "invalid key length")?;
+
         if data.len() < 12 + 16 {
             // nonce + tag
             return Err("ciphertext too short");
         }
+
         let (nonce_bytes, ciphertext) = data.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
 
-        let aad = self.aad();
         let payload = aes_gcm::aead::Payload {
             msg: ciphertext,
             aad: &aad,
         };
 
-        session
-            .cipher
+        let decrypted = cipher
             .decrypt(nonce, payload)
-            .map_err(|_| "decryption failed")
+            .map_err(|_| "decryption failed")?;
+
+        session.k_recv = temp_key;
+        session.ratchet_recv = remote_ratchet;
+
+        Ok(decrypted)
     }
 }
 
