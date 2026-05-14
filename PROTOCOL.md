@@ -105,21 +105,23 @@ Initial public key exchange and feature negotiation MUST be encapsulated in a JS
 ```
 The `extensions` array is REQUIRED and MUST contain at least one supported compression algorithm.
 
-### 6.2 Encrypted Message Frame
+### 6.2 Message Schema
+
+Once client handshake exchange completes, the message on the wire MUST conform to the following schema:
+1. **Message Type**: 1 byte (specyfing the type of the message)
+2. **Payload:** Variable length data specific to the Message Type.
+
+The patronus specifies and acknowledges the folowing message types:
+    - `0x01`: Application Message (UTF-8 encoded JSON).
+    - `0x02`: Control Frame (Lifecycle management).
+    - `0x03`: Extension Data (e.g., File chunks).
+
+### 6.2 Application Message format
 Authenticated messages MUST follow this binary structure:
 1. **Frame Length:** 2 bytes (Big Endian unsigned integer specifying the combined length of the Ciphertext and Authentication Tag).
 2. **Nonce:** 12 bytes (MUST be unique per message).
 3. **Ciphertext:** Variable length (Compressed and Encrypted).
 4. **Authentication Tag:** 16 bytes.
-
-### 6.3 Inner Payload Schema (Plaintext)
-Once decrypted and decompressed, the resulting plaintext MUST conform to the following schema:
-1. **Message Type:** 1 byte.
-    - `0x01`: Application Message (UTF-8 encoded JSON).
-    - `0x02`: Control Frame (Lifecycle management).
-    - `0x03`: Ratchet Synchronization (Section 7.1).
-    - `0x04`: Extension Data (e.g., File chunks).
-2. **Payload:** Variable length data specific to the Message Type.
 
 ### 6.4 Additional Authenticated Data (AAD)
 The AAD for the AES-GCM operation MUST be constructed as:
@@ -132,9 +134,28 @@ Decryption MUST fail if the `topic_id` in the AAD does not match the active sess
 ## 7. Protocol Extensions (Advanced Arcanum)
 
 ### 7.1 Forward Secrecy (Time-Turner Ratchet)
-If implemented, nodes MUST update the session key `K_enc` for every message sent.
-- **Derivation:** `K_enc_{i+1} = HKDF(K_enc_i, "time-turner-ratchet")`.
-- **Synchronization:** The message header MUST include a `ratchet_index` to allow the receiver to advance their KDF state.
+
+If supported, nodes MUST derive two keys based on the role of the client, which are independent of each other.
+
+Receiver expansion: `session-encryption-i2r`, which is used to encrypt messages sent to receiver.
+Sender expansion: `session-encryption-r2i`, which is used to decrypt messages received from the sender.
+
+Communication in Patronus is full duplex, so these two keys MUST be stored across all duration of session.
+
+#### 7.1.1 Message modification
+
+Message type of `0x01` are modified to acomodate the ratchet index, as shown below.
+
+Rachet binary message format:
+1. **Frame Length:** 2 bytes (Big Endian unsigned integer specifying the combined length of the Ciphertext and Authentication Tag).
+2. **Rachet index:** 4 bytes (Big Endian unsigned integer specyfying the index of a key needed to decrypt the message)
+2. **Nonce:** 12 bytes (MUST be unique per message).
+3. **Ciphertext:** Variable length (Compressed and Encrypted).
+4. **Authentication Tag:** 16 bytes.
+
+Rachet indexes move only forward, if the message is received containg the index smaller than the one received in the last message, the incoming message are declared stale and MUST be discarded.
+
+To mitigate a possibility of DOS attacks on applications implementing the Patronus protocol, maximum difference between the following indexes MUST be less or equal to 50. If the index difference is above the specified threshold, the connection MUST be severed.
 
 ### 7.2 Binary Stream Transfer (Owl Post)
 Large data transfers SHOULD bypass the gossip channel in favor of direct QUIC streams.
@@ -191,22 +212,12 @@ Protocol-level errors MUST be signaled using a `0x02` frame followed by a 1-byte
 
 ---
 
-## 9. Operational Modes
+## 9. Security Considerations and Trust Model
 
-### 9.1 Passive Mode (Listening)
-In Passive Mode, a node MUST initialize mDNS advertising as specified in Section 2.1 and listen for incoming QUIC connection requests on the designated port. The node remains in this state until a valid handshake is initiated by a peer.
-
-### 9.2 Active Mode (Initiating)
-In Active Mode, a node initiates a connection to a peer using a resolved `NodeID` or a provided `Ticket`. The initiating node MUST perform the ephemeral key exchange as specified in Section 4.1 immediately upon establishing a transport-level connection.
-
----
-
-## 10. Security Considerations and Trust Model
-
-### 10.1 Trust-On-First-Use (TOFU)
+### 9.1 Trust-On-First-Use (TOFU)
 Implementations MUST persist verified `NodeID` and `Identity` mappings.
 - **Verification:** On subsequent connections, the implementation MUST verify the derived identity against the stored value.
 - **Alerting:** If an identity mismatch occurs for a known `NodeID`, the implementation MUST terminate the connection and alert the user of a potential MITM attack.
 
-### 10.2 Cryptographic Boundaries
+### 9.2 Cryptographic Boundaries
 All cryptographic operations MUST be performed using constant-time implementations where applicable to prevent side-channel leakage.

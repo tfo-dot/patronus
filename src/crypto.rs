@@ -84,7 +84,7 @@ impl CryptoState {
 
         // K_enc (Encryption Key): b"session-encryption", 32 bytes
         let mut okm_enc_send = [0u8; 32];
-        hk.expand(b"ssession-encryption-r2i", &mut okm_enc_send)
+        hk.expand(b"session-encryption-r2i", &mut okm_enc_send)
             .map_err(|_| "HKDF expand failed")?;
 
         let (okm_enc_recv, okm_enc_send) = if is_initiator {
@@ -173,7 +173,7 @@ impl CryptoState {
         let steps = remote_ratchet - session.ratchet_recv;
 
         if steps > 50 {
-            return Err("ratched index jumped too far ahead");
+            return Err("ratchet index jumped too far ahead");
         }
 
         let mut temp_key = session.k_recv;
