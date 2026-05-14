@@ -49,11 +49,18 @@ struct Args {
 }
 
 #[derive(Debug, Clone)]
+pub struct OutboundMessage {
+    pub text: String,
+    pub ttl: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
 pub enum UiEvent {
     Message {
         from: String,
         text: String,
         is_system: bool,
+        ttl: Option<u64>,
     },
     HandshakeComplete(String),
     PeerUpdate {
@@ -109,7 +116,7 @@ async fn main() -> Result<()> {
     let mut app = App::new();
 
     let (ui_tx, ui_rx) = mpsc::channel(100);
-    let (msg_tx, msg_rx) = mpsc::channel::<String>(100);
+    let (msg_tx, msg_rx) = mpsc::channel::<OutboundMessage>(100);
     let (connect_tx, connect_rx) = mpsc::channel::<String>(100);
 
     let app_port: u16 = (rand::random::<u16>() % 255) + 6000;
@@ -156,7 +163,7 @@ async fn run_network(
     singing_key: SigningKey,
     app_port: u16,
     ui_tx: mpsc::Sender<UiEvent>,
-    mut msg_rx: mpsc::Receiver<String>,
+    mut msg_rx: mpsc::Receiver<OutboundMessage>,
     mut connect_rx: mpsc::Receiver<String>,
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{app_port}")).await?;
@@ -179,6 +186,7 @@ async fn run_network(
                                     from: "System".to_string(),
                                     text: format!("Connection to {addr} failed: {e}"),
                                     is_system: true,
+                                    ttl: None,
                                 }).await;
                             }
                         }
@@ -195,6 +203,7 @@ async fn run_network(
                 from: "System".to_string(),
                 text: format!("Handshake failed: {e}"),
                 is_system: true,
+                ttl: None,
             }).await;
             continue;
         }
@@ -218,12 +227,14 @@ async fn run_network(
             from: "System".to_string(),
             text: format!("Connection established! Our extensions: [{our_exts}]. Peer extensions: [{peer_exts}]"),
             is_system: true,
+            ttl: None,
         }).await;
 
         let _ = ui_tx.send(UiEvent::Message {
             from: "System".to_string(),
             text: format!("Connected to {peer_id}"),
             is_system: true,
+            ttl: None,
         }).await;
 
         // established: interval_at so the first tick fires after the interval, not immediately
@@ -243,8 +254,12 @@ async fn run_network(
             tokio::select! {
                 msg = msg_rx.recv() => {
                     match msg {
-                        Some(text) => {
-                            let json = serde_json::json!({ "text": text });
+                        Some(out_msg) => {
+                            let json = if let Some(ttl) = out_msg.ttl {
+                                serde_json::json!({ "text": out_msg.text, "ttl": ttl })
+                            } else {
+                                serde_json::json!({ "text": out_msg.text })
+                            };
                             if client.send_app_message(&mut stream, &json).await.is_err() {
                                 send_bye = false;
                                 break;
@@ -259,10 +274,12 @@ async fn run_network(
                         Ok((0x01, payload)) => {
                             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&payload)
                                 && let Some(text) = json["text"].as_str() {
+                                let ttl = json["ttl"].as_u64();
                                 let _ = ui_tx.send(UiEvent::Message {
                                     from: peer_id.clone(),
                                     text: text.to_string(),
                                     is_system: false,
+                                    ttl,
                                 }).await;
                             }
                         }
@@ -288,6 +305,7 @@ async fn run_network(
                                 from: "System".to_string(),
                                 text: format!("Unknown message type: 0x{msg_type:02x}"),
                                 is_system: true,
+                                ttl: None,
                             }).await;
                         }
                         Err(e) => {
@@ -295,6 +313,7 @@ async fn run_network(
                                 from: "System".to_string(),
                                 text: format!("Connection lost with {peer_id}: {e}"),
                                 is_system: true,
+                                ttl: None,
                             }).await;
                             send_bye = false;
                             break;
@@ -309,6 +328,7 @@ async fn run_network(
                             from: "System".to_string(),
                             text: format!("Connection timed out: {peer_id}"),
                             is_system: true,
+                            ttl: None,
                         }).await;
                         send_bye = false;
                         break;
@@ -332,6 +352,7 @@ async fn run_network(
             from: "System".to_string(),
             text: format!("{peer_id} disconnected."),
             is_system: true,
+            ttl: None,
         }).await;
     }
 }

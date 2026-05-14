@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::Result;
 use crate::discovery::DiscoveryService;
@@ -13,10 +13,18 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 
-use crate::UiEvent;
+use crate::{UiEvent, OutboundMessage};
+
+pub struct Message {
+    pub from: String,
+    pub content: String,
+    pub is_system: bool,
+    pub ttl: Option<u64>,
+    pub received_at: Instant,
+}
 
 pub struct App {
-    pub messages: Vec<(String, String, bool)>, // (sender, content, is_system)
+    pub messages: Vec<Message>,
     pub peers: HashMap<String, (String, String)>, // (name, address)
     pub peer_ids: Vec<String>,
     pub custom_names: HashMap<String, String>,
@@ -26,6 +34,7 @@ pub struct App {
     pub rename_input: String,
     pub is_renaming: bool,
     pub broadcasting: bool,
+    pub current_ttl: Option<u64>,
 }
 
 impl App {
@@ -41,6 +50,7 @@ impl App {
             rename_input: String::new(),
             is_renaming: false,
             broadcasting: true,
+            current_ttl: None,
         }
     }
 
@@ -59,17 +69,29 @@ impl App {
             id.to_string()
         }
     }
+
+    pub fn cleanup_expired_messages(&mut self) {
+        let now = Instant::now();
+        self.messages.retain(|msg| {
+            if let Some(ttl) = msg.ttl {
+                now.duration_since(msg.received_at) < Duration::from_secs(ttl)
+            } else {
+                true
+            }
+        });
+    }
 }
 
 pub async fn run_app(
     terminal: &mut DefaultTerminal,
     mut app: App,
     mut ui_rx: mpsc::Receiver<UiEvent>,
-    msg_tx: mpsc::Sender<String>,
+    msg_tx: mpsc::Sender<OutboundMessage>,
     connect_tx: mpsc::Sender<String>,
     discovery: Arc<DiscoveryService>,
 ) -> Result<()> {
     loop {
+        app.cleanup_expired_messages();
         terminal.draw(|f| render(f, &app))?;
 
         if event::poll(Duration::from_millis(10))? {
@@ -127,19 +149,53 @@ pub async fn run_app(
                             KeyCode::Enter => {
                                 if !app.input.is_empty() {
                                     let input = app.input.drain(..).collect::<String>();
-                                    if msg_tx.try_send(input.clone()).is_ok() {
-                                        app.messages.push(("Me".to_string(), input, false));
+                                    
+                                    if input.starts_with("/ttl ") {
+                                        let parts: Vec<&str> = input.split_whitespace().collect();
+                                        if parts.len() == 2 {
+                                            if let Ok(ttl) = parts[1].parse::<u64>() {
+                                                if ttl == 0 {
+                                                    app.current_ttl = None;
+                                                    app.messages.push(Message {
+                                                        from: "System".to_string(),
+                                                        content: "TTL disabled".to_string(),
+                                                        is_system: true,
+                                                        ttl: None,
+                                                        received_at: Instant::now(),
+                                                    });
+                                                } else {
+                                                    app.current_ttl = Some(ttl);
+                                                    app.messages.push(Message {
+                                                        from: "System".to_string(),
+                                                        content: format!("TTL set to {}s", ttl),
+                                                        is_system: true,
+                                                        ttl: None,
+                                                        received_at: Instant::now(),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    } else if msg_tx.try_send(OutboundMessage { text: input.clone(), ttl: app.current_ttl }).is_ok() {
+                                        app.messages.push(Message {
+                                            from: "Me".to_string(),
+                                            content: input,
+                                            is_system: false,
+                                            ttl: app.current_ttl,
+                                            received_at: Instant::now(),
+                                        });
                                     }
                                 } else if !app.peer_ids.is_empty() {
                                     let peer_id = &app.peer_ids[app.selected];
                                     if let Some((name, addr)) = app.peers.get(peer_id) {
                                         let display_name =
                                             app.custom_names.get(peer_id).unwrap_or(name);
-                                        app.messages.push((
-                                            "System".to_string(),
-                                            format!("Connecting to {}...", display_name),
-                                            true,
-                                        ));
+                                        app.messages.push(Message {
+                                            from: "System".to_string(),
+                                            content: format!("Connecting to {}...", display_name),
+                                            is_system: true,
+                                            ttl: None,
+                                            received_at: Instant::now(),
+                                        });
                                         let _ = connect_tx.try_send(addr.clone());
                                     }
                                 }
@@ -195,6 +251,7 @@ pub async fn run_app(
                     from,
                     mut text,
                     is_system,
+                    ttl,
                 } => {
                     if is_system {
                         if text.starts_with("Connected to ") {
@@ -217,7 +274,13 @@ pub async fn run_app(
                             }
                         }
                     }
-                    app.messages.push((from, text, is_system));
+                    app.messages.push(Message {
+                        from,
+                        content: text,
+                        is_system,
+                        ttl,
+                        received_at: Instant::now(),
+                    });
                 }
                 UiEvent::HandshakeComplete(code) => {
                     app.identity_phrase = Some(code);
@@ -273,12 +336,19 @@ fn render(f: &mut Frame, app: &App) {
         ("OFF", Color::Red)
     };
 
+    let ttl_info = if let Some(ttl) = app.current_ttl {
+        format!(" | TTL: {}s", ttl)
+    } else {
+        "".to_string()
+    };
+
     let info_text = vec![Line::from(vec![
         Span::styled("Identity: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(identity, Style::default().fg(Color::Cyan)),
         Span::raw(" | "),
         Span::styled("Broadcast: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(broadcast_label, Style::default().fg(broadcast_color)),
+        Span::raw(ttl_info),
     ])];
     let info = Paragraph::new(info_text).block(
         Block::default()
@@ -327,29 +397,40 @@ fn render(f: &mut Frame, app: &App) {
         .messages
         .iter()
         .rev()
-        .map(|(from, content, is_system)| {
-            let style = if *is_system {
+        .map(|msg| {
+            let style = if msg.is_system {
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::ITALIC)
-            } else if from == "Me" {
+            } else if msg.from == "Me" {
                 Style::default().fg(Color::Green)
             } else {
                 Style::default().fg(Color::Yellow)
             };
 
-            let display_from = if *is_system || from == "Me" {
-                from.clone()
+            let display_from = if msg.is_system || msg.from == "Me" {
+                msg.from.clone()
             } else {
-                app.get_display_name(from)
+                app.get_display_name(&msg.from)
             };
 
-            let header = Span::styled(
-                format!("{}: ", display_from),
-                style.add_modifier(Modifier::BOLD),
-            );
-            let body = Span::raw(content);
-            ListItem::new(Line::from(vec![header, body]))
+            let mut spans = vec![
+                Span::styled(
+                    format!("{}: ", display_from),
+                    style.add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&msg.content),
+            ];
+
+            if let Some(ttl) = msg.ttl {
+                let remaining = ttl.saturating_sub(Instant::now().duration_since(msg.received_at).as_secs());
+                spans.push(Span::styled(
+                    format!(" ({}s)", remaining),
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::ITALIC),
+                ));
+            }
+
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -359,7 +440,7 @@ fn render(f: &mut Frame, app: &App) {
     let input = Paragraph::new(app.input.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Message (Esc to quit, Ctrl+B to toggle broadcast, Ctrl+R to rename peer)"),
+            .title("Message (Esc to quit, Ctrl+B to toggle broadcast, Ctrl+R to rename peer, /ttl <s|0>)"),
     );
     f.render_widget(input, main_layout[2]);
 
