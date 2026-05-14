@@ -68,8 +68,15 @@ Every 1:1 session MUST bind its ephemeral keys to the nodes' static identities t
 ### 4.2 Key Material Extraction
 Nodes MUST use HKDF-SHA256 to derive session keys from the shared secret $S$.
 - **Salt:** `b"patronus-protocol-v1"`
-- **K_enc (Encryption Key):** Derived using info string `b"session-encryption"`. Length: 32 bytes.
+- **K_i2r (Initiator→Responder Encryption Key):** Derived using info string `b"session-encryption-i2r"`. Length: 32 bytes.
+- **K_r2i (Responder→Initiator Encryption Key):** Derived using info string `b"session-encryption-r2i"`. Length: 32 bytes.
 - **K_id (Identity Key):** Derived using info string `b"identity-projection"`. Length: 3 bytes.
+
+Directional key assignment MUST be performed as follows:
+- The **initiator** MUST use $K_{i2r}$ as its send key and $K_{r2i}$ as its receive key.
+- The **responder** MUST use $K_{r2i}$ as its send key and $K_{i2r}$ as its receive key.
+
+This directional split ensures that each side maintains an independent ratchet chain (Section 7.1), preventing key state divergence when both nodes transmit concurrently.
 
 ---
 
