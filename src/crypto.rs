@@ -137,6 +137,64 @@ impl CryptoState {
         aad
     }
 
+    pub fn derive_file_key(&self, file_id: &[u8]) -> Result<[u8; 32], &'static str> {
+        let session = self.session.as_ref().ok_or("handshake not completed")?;
+        // Use the topic_id as salt to ensure both sides derive the same key
+        let hk = Hkdf::<Sha256>::new(Some(&session.topic_id), file_id);
+        let mut file_key = [0u8; 32];
+        hk.expand(b"owl-post-file-key", &mut file_key)
+            .map_err(|_| "HKDF expand failed")?;
+        Ok(file_key)
+    }
+
+    pub fn encrypt_with_key(&self, key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+        let session = self.session.as_ref().expect("handshake not completed");
+        let aad = Self::compute_aad(&session.topic_id);
+
+        let cipher = Aes256Gcm::new_from_slice(key).expect("invalid key length");
+
+        let nonce_bytes: [u8; 12] = rand::random();
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let payload = aes_gcm::aead::Payload {
+            msg: plaintext,
+            aad: &aad,
+        };
+
+        let ciphertext = cipher.encrypt(nonce, payload).expect("encryption failed");
+
+        let mut out = Vec::with_capacity(12 + ciphertext.len());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        out
+    }
+
+    pub fn decrypt_with_key(
+        &self,
+        key: &[u8; 32],
+        data: &[u8],
+    ) -> Result<Vec<u8>, &'static str> {
+        let session = self.session.as_ref().ok_or("handshake not completed")?;
+        let aad = Self::compute_aad(&session.topic_id);
+        let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| "invalid key length")?;
+
+        if data.len() < 12 + 16 {
+            return Err("ciphertext too short");
+        }
+
+        let (nonce_bytes, ciphertext) = data.split_at(12);
+        let nonce = Nonce::from_slice(nonce_bytes);
+
+        let payload = aes_gcm::aead::Payload {
+            msg: ciphertext,
+            aad: &aad,
+        };
+
+        cipher
+            .decrypt(nonce, payload)
+            .map_err(|_| "decryption failed")
+    }
+
     pub fn encrypt(&mut self, plaintext: &[u8]) -> (Vec<u8>, u32) {
         let session = self.session.as_mut().expect("handshake not completed");
         let aad = Self::compute_aad(&session.topic_id);

@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::bytes::BufMut;
 use x25519_dalek::PublicKey;
 
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["compression:zstd", "ratchet:v1"];
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["compression:zstd", "ratchet:v1", "owl-post:v1"];
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HandshakePacket {
@@ -20,6 +20,15 @@ pub struct HandshakePacket {
     pub spk: String,
     pub sig: String,
     pub extensions: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileOffer {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub file_name: String,
+    pub size: u64,
+    pub merkle_root: String,
 }
 
 pub struct PatronusClient {
@@ -169,12 +178,77 @@ impl PatronusClient {
         Ok(())
     }
 
+    pub async fn send_file_offer<S>(&mut self, stream: &mut S, offer: &FileOffer) -> Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let payload = serde_json::to_vec(offer)?;
+        let frame = self.encrypt_message(0x01, &payload)?;
+        stream.write_all(&frame).await?;
+        Ok(())
+    }
 
-    pub async fn receive_message<S>(&mut self, stream: &mut S) -> Result<(u8, Vec<u8>)>
+    pub async fn send_file_chunk<S>(&mut self, stream: &mut S, key: &[u8; 32], chunk: &[u8]) -> Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        // 0x03: Extension Data
+        let mut plaintext = Vec::with_capacity(1 + chunk.len());
+        plaintext.push(0x03);
+        plaintext.extend_from_slice(chunk);
+
+        // Compression (optional for binary data, but protocol says we MUST use agreed alg)
+        let compressed = match self.selected_compression.as_deref() {
+            Some("compression:zstd") => zstd::encode_all(Cursor::new(plaintext), 3)?,
+            _ => plaintext,
+        };
+
+        // Encrypt with file-specific key (NO RATCHET)
+        let encrypted = self.crypto.encrypt_with_key(key, &compressed);
+
+        // Frame: 2-byte length + 4-byte 0xFFFFFFFF (sentinel for no ratchet) + 12-byte nonce + payload
+        let nonce = &encrypted[..12];
+        let ciphertext_and_tag = &encrypted[12..];
+
+        let mut frame = Vec::with_capacity(2 + 4 + 12 + ciphertext_and_tag.len());
+        frame.put_u16(ciphertext_and_tag.len() as u16);
+        frame.put_u32(0xFFFFFFFF); // Sentinel for "Not a Ratchet Message"
+        frame.extend_from_slice(nonce);
+        frame.extend_from_slice(ciphertext_and_tag);
+
+        stream.write_all(&frame).await?;
+        Ok(())
+    }
+
+    pub fn decrypt_file_chunk(&mut self, key: &[u8; 32], frame: &[u8]) -> Result<(u8, Vec<u8>)> {
+        // frame contains: nonce(12) + ciphertext+tag
+        let decrypted = self
+            .crypto
+            .decrypt_with_key(key, frame)
+            .map_err(|e| anyhow!(e))?;
+
+        let mut decompressed = Vec::new();
+        match self.selected_compression.as_deref() {
+            Some("compression:zstd") => {
+                zstd::Decoder::new(Cursor::new(decrypted))?.read_to_end(&mut decompressed)?;
+            }
+            _ => decompressed = decrypted,
+        }
+
+        if decompressed.is_empty() {
+            return Err(anyhow!("Empty payload after decompression"));
+        }
+
+        let msg_type = decompressed[0];
+        let payload = decompressed[1..].to_vec();
+
+        Ok((msg_type, payload))
+    }
+
+    pub async fn receive_message<S>(&mut self, stream: &mut S) -> Result<(u8, Vec<u8>, bool, u32)>
     where
         S: tokio::io::AsyncRead + Unpin,
     {
-        // 6.2 Updated: 2-byte length, 4-byte ratchet, 12-byte nonce, then length bytes (ciphertext+tag)
         let len = stream.read_u16().await?;
         let ratchet_index = stream.read_u32().await?;
         let mut nonce = [0u8; 12];
@@ -182,12 +256,22 @@ impl PatronusClient {
         let mut payload = vec![0u8; len as usize];
         stream.read_exact(&mut payload).await?;
 
-        let mut combined = Vec::with_capacity(4 + 12 + payload.len());
-        combined.put_u32(ratchet_index);
-        combined.extend_from_slice(&nonce);
-        combined.extend_from_slice(&payload);
+        let is_ratchet = ratchet_index != 0xFFFFFFFF;
 
-        self.decrypt_message(&combined)
+        if is_ratchet {
+            let mut combined = Vec::with_capacity(4 + 12 + payload.len());
+            combined.put_u32(ratchet_index);
+            combined.extend_from_slice(&nonce);
+            combined.extend_from_slice(&payload);
+            let (msg_type, data) = self.decrypt_message(&combined)?;
+            Ok((msg_type, data, true, ratchet_index))
+        } else {
+            // It's a file chunk or other extension data, the caller must provide the key
+            let mut combined = Vec::with_capacity(12 + payload.len());
+            combined.extend_from_slice(&nonce);
+            combined.extend_from_slice(&payload);
+            Ok((0x03, combined, false, 0))
+        }
     }
 
     pub fn encrypt_message(&mut self, msg_type: u8, payload: &[u8]) -> Result<Vec<u8>> {
