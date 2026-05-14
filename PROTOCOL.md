@@ -123,7 +123,7 @@ The patronus specifies and acknowledges the folowing message types:
     - `0x02`: Control Frame (Lifecycle management).
     - `0x03`: Extension Data (e.g., File chunks).
 
-### 6.2 Application Message format
+### 6.3 Application Message format
 Authenticated messages MUST follow this binary structure:
 1. **Frame Length:** 2 bytes (Big Endian unsigned integer specifying the combined length of the Ciphertext and Authentication Tag).
 2. **Nonce:** 12 bytes (MUST be unique per message).
