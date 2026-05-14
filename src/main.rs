@@ -5,7 +5,9 @@ mod tui;
 
 use std::{fs, path::Path, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use crate::client::FileOffer;
+use tokio::io::AsyncReadExt as _;
 use clap::Parser;
 use data_encoding::BASE64;
 use directories::ProjectDirs;
@@ -239,11 +241,92 @@ async fn run_network(
         // drain messages that queued up while disconnected
         while msg_rx.try_recv().is_ok() {}
 
+        let mut receiving_file: Option<(tokio::fs::File, String, u64)> = None;
+        let mut receiving_key: Option<[u8; 32]> = None;
+        let mut receiving_bytes_seen = 0u64;
+
         loop {
             tokio::select! {
                 msg = msg_rx.recv() => {
                     match msg {
                         Some(text) => {
+                            if text.starts_with("/send ") {
+                                let path_str = text.strip_prefix("/send ").unwrap().trim();
+                                let path = Path::new(path_str);
+                                if !path.exists() {
+                                    let _ = ui_tx.send(UiEvent::Message {
+                                        from: "System".to_string(),
+                                        text: format!("File not found: {path_str}"),
+                                        is_system: true,
+                                    }).await;
+                                    continue;
+                                }
+
+                                let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+                                let metadata = fs::metadata(path)?;
+                                let size = metadata.len();
+
+                                // Calculate BLAKE3 hash
+                                let mut hasher = blake3::Hasher::new();
+                                let mut file = tokio::fs::File::open(path).await?;
+                                let mut buffer = vec![0u8; 64 * 1024];
+                                while let Ok(n) = file.read(&mut buffer).await {
+                                    if n == 0 { break; }
+                                    hasher.update(&buffer[..n]);
+                                }
+                                let merkle_root = hasher.finalize().to_hex().to_string();
+
+                                let offer = FileOffer {
+                                    msg_type: "file-offer".to_string(),
+                                    file_name: file_name.clone(),
+                                    size,
+                                    merkle_root: merkle_root.clone(),
+                                };
+
+                                if let Err(e) = client.send_file_offer(&mut stream, &offer).await {
+                                    let _ = ui_tx.send(UiEvent::Message {
+                                        from: "System".to_string(),
+                                        text: format!("Failed to send file offer: {e}"),
+                                        is_system: true,
+                                    }).await;
+                                    continue;
+                                }
+
+                                let _ = ui_tx.send(UiEvent::Message {
+                                    from: "System".to_string(),
+                                    text: format!("Offering file: {file_name} ({size} bytes)"),
+                                    is_system: true,
+                                }).await;
+
+                                // Derive file key and send chunks
+                                let file_key = client.crypto.derive_file_key(merkle_root.as_bytes()).map_err(|e| anyhow!(e))?;
+                                
+                                file = tokio::fs::File::open(path).await?; // Re-open to start from beginning
+                                let mut chunk_buffer = vec![0u8; 16384]; // 16KB chunks
+                                let mut _sent_bytes = 0;
+
+                                while let Ok(n) = file.read(&mut chunk_buffer).await {
+                                    if n == 0 { break; }
+                                    if let Err(e) = client.send_file_chunk(&mut stream, &file_key, &chunk_buffer[..n]).await {
+                                        let _ = ui_tx.send(UiEvent::Message {
+                                            from: "System".to_string(),
+                                            text: format!("Error sending file chunk: {e}"),
+                                            is_system: true,
+                                        }).await;
+                                        break;
+                                    }
+                                    _sent_bytes += n as u64;
+                                }
+
+                                let _ = ui_tx.send(UiEvent::Message {
+                                    from: "System".to_string(),
+                                    text: format!("Finished sending {file_name}"),
+                                    is_system: true,
+                                }).await;
+                                
+                                continue;
+                            }
+
                             let json = serde_json::json!({ "text": text });
                             if client.send_app_message(&mut stream, &json).await.is_err() {
                                 send_bye = false;
@@ -256,18 +339,40 @@ async fn run_network(
 
                 res = client.receive_message(&mut stream) => {
                     match res {
-                        Ok((0x01, payload)) => {
-                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&payload)
-                                && let Some(text) = json["text"].as_str() {
-                                let _ = ui_tx.send(UiEvent::Message {
-                                    from: peer_id.clone(),
-                                    text: text.to_string(),
-                                    is_system: false,
-                                }).await;
+                        Ok((0x01, payload, _, _)) => {
+                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                                if json["type"] == "file-offer" {
+                                    let offer: FileOffer = serde_json::from_value(json.clone())?;
+                                    let _ = ui_tx.send(UiEvent::Message {
+                                        from: "System".to_string(),
+                                        text: format!("Receiving file offer: {} ({} bytes)", offer.file_name, offer.size),
+                                        is_system: true,
+                                    }).await;
+
+                                    // Auto-accept and prepare for receiving
+                                    let downloads_dir = Path::new("downloads");
+                                    if !downloads_dir.exists() {
+                                        tokio::fs::create_dir_all(downloads_dir).await?;
+                                    }
+                                    let file_path = downloads_dir.join(&offer.file_name);
+                                    let file = tokio::fs::File::create(file_path).await?;
+                                    
+                                    let key = client.crypto.derive_file_key(offer.merkle_root.as_bytes()).map_err(|e| anyhow!(e))?;
+                                    
+                                    receiving_file = Some((file, offer.file_name, offer.size));
+                                    receiving_key = Some(key);
+                                    receiving_bytes_seen = 0;
+                                } else if let Some(text) = json["text"].as_str() {
+                                    let _ = ui_tx.send(UiEvent::Message {
+                                        from: peer_id.clone(),
+                                        text: text.to_string(),
+                                        is_system: false,
+                                    }).await;
+                                }
                             }
                         }
                         // 8.2: lumos pulse
-                        Ok((0x02, payload)) => {
+                        Ok((0x02, payload, _, _)) => {
                             match payload.first().copied() {
                                 Some(CTRL_PING) => {
                                     let _ = client.send_control_frame(&mut stream, CTRL_PONG).await;
@@ -283,7 +388,37 @@ async fn run_network(
                                 _ => {}
                             }
                         }
-                        Ok((msg_type, _)) => {
+                        Ok((0x03, payload, false, _)) => {
+                            if let (Some((mut file, name, size)), Some(key)) = (receiving_file.take(), receiving_key) {
+                                match client.decrypt_file_chunk(&key, &payload) {
+                                    Ok((0x03, chunk)) => {
+                                        use tokio::io::AsyncWriteExt;
+                                        file.write_all(&chunk).await?;
+                                        receiving_bytes_seen += chunk.len() as u64;
+
+                                        if receiving_bytes_seen >= size {
+                                            let _ = ui_tx.send(UiEvent::Message {
+                                                from: "System".to_string(),
+                                                text: format!("File transfer complete: {name}"),
+                                                is_system: true,
+                                            }).await;
+                                            receiving_file = None;
+                                            receiving_key = None;
+                                        } else {
+                                            receiving_file = Some((file, name, size));
+                                        }
+                                    }
+                                    _ => {
+                                        let _ = ui_tx.send(UiEvent::Message {
+                                            from: "System".to_string(),
+                                            text: "Failed to decrypt file chunk".to_string(),
+                                            is_system: true,
+                                        }).await;
+                                    }
+                                }
+                            }
+                        }
+                        Ok((msg_type, _, _, _)) => {
                             let _ = ui_tx.send(UiEvent::Message {
                                 from: "System".to_string(),
                                 text: format!("Unknown message type: 0x{msg_type:02x}"),
