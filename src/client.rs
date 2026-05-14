@@ -63,6 +63,9 @@ impl PatronusClient {
         let handshake_json = serde_json::to_vec(&handshake)?;
 
         // Write handshake (6.1: 2-byte BE length + JSON)
+        if handshake_json.len() > u16::MAX as usize {
+            return Err(anyhow!("Handshake packet too large"));
+        }
         stream.write_u16(handshake_json.len() as u16).await?;
         stream.write_all(&handshake_json).await?;
 
@@ -157,6 +160,16 @@ impl PatronusClient {
         Ok(())
     }
 
+    pub async fn send_control_frame<S>(&mut self, stream: &mut S, payload: u8) -> Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let frame = self.encrypt_message(0x02, &[payload])?;
+        stream.write_all(&frame).await?;
+        Ok(())
+    }
+
+
     pub async fn receive_message<S>(&mut self, stream: &mut S) -> Result<(u8, Vec<u8>)>
     where
         S: tokio::io::AsyncRead + Unpin,
@@ -202,6 +215,9 @@ impl PatronusClient {
         let nonce = &encrypted[..12];
         let ciphertext_and_tag = &encrypted[12..];
 
+        if ciphertext_and_tag.len() > u16::MAX as usize {
+            return Err(anyhow!("Message too large to frame (max {} bytes)", u16::MAX));
+        }
         let mut frame = Vec::with_capacity(2 + 4 + 12 + ciphertext_and_tag.len());
         frame.put_u16(ciphertext_and_tag.len() as u16);
         frame.put_u32(ratchet_index);
