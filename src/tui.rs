@@ -36,23 +36,49 @@ pub fn format_ttl(secs: u64) -> String {
     }
 }
 
-/// Parses a TTL string with an optional unit suffix: 30s, 5m, 2h, 1d, or a bare number (seconds).
 fn parse_ttl(s: &str) -> Result<u64, ()> {
     if s.is_empty() {
         return Err(());
     }
-    let (digits, multiplier) = if let Some(n) = s.strip_suffix('d') {
-        (n, 86400u64)
-    } else if let Some(n) = s.strip_suffix('h') {
-        (n, 3600u64)
-    } else if let Some(n) = s.strip_suffix('m') {
-        (n, 60u64)
-    } else if let Some(n) = s.strip_suffix('s') {
-        (n, 1u64)
-    } else {
-        (s, 1u64)
-    };
-    digits.parse::<u64>().map(|n| n * multiplier).map_err(|_| ())
+
+    let mut total: u64 = 0;
+    let mut current_val: u64 = 0;
+    let mut num_started = false;
+
+    for c in s.chars() {
+        if let Some(digit) = c.to_digit(10) {
+
+            current_val = current_val
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(digit as u64))
+                .ok_or(())?;
+            num_started = true;
+        } else {
+            if !num_started {
+                return Err(());
+            }
+
+            let multiplier = match c {
+                'd' => 86400,
+                'h' => 3600,
+                'm' => 60,
+                's' => 1,
+                _ => return Err(()),
+            };
+
+            let chunk = current_val.checked_mul(multiplier).ok_or(())?;
+            total = total.checked_add(chunk).ok_or(())?;
+            
+            current_val = 0;
+            num_started = false;
+        }
+    }
+
+    if num_started {
+        total = total.checked_add(current_val).ok_or(())?;
+    }
+
+    Ok(total)
 }
 
 pub struct Message {
@@ -218,12 +244,9 @@ pub async fn run_app(
                                             match parse_ttl(parts[1]) {
                                                 Ok(0) => {
                                                     app.current_ttl = None;
-                                                    //ttl_notice is not part of the Patronus spec (7.3 only defines the per-message `ttl` field). This is an out-of-spec courtesy notification so the peer knows your messages are no longer set to expire.
-                                                    let _ = msg_tx.try_send(OutboundMessage {
-                                                        text: String::new(),
-                                                        ttl: None,
-                                                        is_ttl_notice: true,
-                                                    });
+                                                    
+                                                    let _ = msg_tx.try_send(OutboundMessage::TTLNotice { ttl: None });
+
                                                     app.messages.push(Message {
                                                         from: "System".to_string(),
                                                         content: "TTL disabled — new messages will persist.".to_string(),
@@ -234,12 +257,9 @@ pub async fn run_app(
                                                 }
                                                 Ok(ttl) if ttl <= MAX_TTL => {
                                                     app.current_ttl = Some(ttl);
-                                                    //Same as above. This is an out-of-spec courtesy notification so the peer knows your messages are set to expire.
-                                                    let _ = msg_tx.try_send(OutboundMessage {
-                                                        text: String::new(),
-                                                        ttl: Some(ttl),
-                                                        is_ttl_notice: true,
-                                                    });
+
+                                                    let _ = msg_tx.try_send(OutboundMessage::TTLNotice { ttl: Some(ttl) });
+
                                                     app.messages.push(Message {
                                                         from: "System".to_string(),
                                                         content: format!("TTL set to {} — new messages will disappear after that time.", format_ttl(ttl)),
@@ -270,7 +290,7 @@ pub async fn run_app(
                                                 }
                                             }
                                         }
-                                    } else if msg_tx.try_send(OutboundMessage { text: input.clone(), ttl: app.current_ttl, is_ttl_notice: false }).is_ok() {
+                                    } else if msg_tx.try_send(OutboundMessage::Message { text: input.clone(), ttl: app.current_ttl }).is_ok() {
                                         app.messages.push(Message {
                                             from: "Me".to_string(),
                                             content: input,
