@@ -10,8 +10,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::bytes::BufMut;
 use x25519_dalek::PublicKey;
 
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["compression:zstd", "ratchet:v1"];
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["compression:zstd", "ratchet:v1", "vanishing_ink:v1"];
 
+#[derive(Debug, Clone)]
+pub enum OutboundMessage {
+    Message { text: String, ttl: Option<u64> },
+    TTLNotice { ttl: Option<u64> },
+}
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HandshakePacket {
     #[serde(rename = "type")]
@@ -123,7 +128,9 @@ impl PatronusClient {
             .cloned();
 
         if self.selected_compression.is_none() {
-            return Err(anyhow!("Handshake Failed (0x01): No common compression algorithm"));
+            return Err(anyhow!(
+                "Handshake Failed (0x01): No common compression algorithm"
+            ));
         }
 
         // Track all agreed extensions
@@ -146,16 +153,27 @@ impl PatronusClient {
         Ok(())
     }
 
-    pub async fn send_app_message<S>(
-        &mut self,
-        stream: &mut S,
-        json_content: &serde_json::Value,
-    ) -> Result<()>
+    pub async fn send_app_message<S>(&mut self, stream: &mut S, msg: OutboundMessage) -> Result<()>
     where
         S: tokio::io::AsyncWrite + Unpin,
     {
-        let payload = serde_json::to_vec(json_content)?;
-        let frame = self.encrypt_message(0x01, &payload)?; // 0x01: Application Message
+        let (msg_type, json) = match msg {
+            OutboundMessage::Message { text, ttl } => {
+                let mut base = serde_json::json!({"text": text});
+
+                if let Some(val) = ttl {
+                    if let Some(obj) = base.as_object_mut() {
+                        obj.insert("ttl".to_string(), val.into());
+                    }
+                }
+
+                (0x01, base)
+            }
+            OutboundMessage::TTLNotice { ttl } => (0x03, serde_json::json!({ "ttl_notice": ttl })),
+        };
+
+        let payload = serde_json::to_vec(&json)?;
+        let frame = self.encrypt_message(msg_type, &payload)?;
         stream.write_all(&frame).await?;
         Ok(())
     }
@@ -168,7 +186,6 @@ impl PatronusClient {
         stream.write_all(&frame).await?;
         Ok(())
     }
-
 
     pub async fn receive_message<S>(&mut self, stream: &mut S) -> Result<(u8, Vec<u8>)>
     where
@@ -216,7 +233,10 @@ impl PatronusClient {
         let ciphertext_and_tag = &encrypted[12..];
 
         if ciphertext_and_tag.len() > u16::MAX as usize {
-            return Err(anyhow!("Message too large to frame (max {} bytes)", u16::MAX));
+            return Err(anyhow!(
+                "Message too large to frame (max {} bytes)",
+                u16::MAX
+            ));
         }
         let mut frame = Vec::with_capacity(2 + 4 + 12 + ciphertext_and_tag.len());
         frame.put_u16(ciphertext_and_tag.len() as u16);

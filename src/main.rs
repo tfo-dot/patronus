@@ -18,6 +18,8 @@ use tokio::sync::mpsc;
 use tokio::time;
 use tui::{App, run_app};
 
+use crate::client::OutboundMessage;
+
 // 8.2: lumos pulse
 const CTRL_PING: u8 = 0x01;
 const CTRL_PONG: u8 = 0x02;
@@ -54,6 +56,7 @@ pub enum UiEvent {
         from: String,
         text: String,
         is_system: bool,
+        ttl: Option<u64>,
     },
     HandshakeComplete(String),
     PeerUpdate {
@@ -99,7 +102,7 @@ async fn main() -> Result<()> {
             }
         }
     }
-        .unwrap();
+    .unwrap();
 
     let ed_sk = pk.key_data().ed25519().expect("Ed25519 key required");
     let signing_key = SigningKey::from_bytes(ed_sk.private.as_ref());
@@ -109,7 +112,7 @@ async fn main() -> Result<()> {
     let mut app = App::new();
 
     let (ui_tx, ui_rx) = mpsc::channel(100);
-    let (msg_tx, msg_rx) = mpsc::channel::<String>(100);
+    let (msg_tx, msg_rx) = mpsc::channel::<OutboundMessage>(100);
     let (connect_tx, connect_rx) = mpsc::channel::<String>(100);
 
     let app_port: u16 = (rand::random::<u16>() % 255) + 6000;
@@ -143,7 +146,7 @@ async fn main() -> Result<()> {
         connect_tx,
         discovery.clone(),
     )
-        .await;
+    .await;
 
     ratatui::restore();
 
@@ -156,7 +159,7 @@ async fn run_network(
     singing_key: SigningKey,
     app_port: u16,
     ui_tx: mpsc::Sender<UiEvent>,
-    mut msg_rx: mpsc::Receiver<String>,
+    mut msg_rx: mpsc::Receiver<OutboundMessage>,
     mut connect_rx: mpsc::Receiver<String>,
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{app_port}")).await?;
@@ -179,6 +182,7 @@ async fn run_network(
                                     from: "System".to_string(),
                                     text: format!("Connection to {addr} failed: {e}"),
                                     is_system: true,
+                                    ttl: None,
                                 }).await;
                             }
                         }
@@ -191,15 +195,21 @@ async fn run_network(
         let mut client = client::PatronusClient::new(singing_key.clone());
 
         if let Err(e) = client.handshake(&mut stream, is_initiator).await {
-            let _ = ui_tx.send(UiEvent::Message {
-                from: "System".to_string(),
-                text: format!("Handshake failed: {e}"),
-                is_system: true,
-            }).await;
+            let _ = ui_tx
+                .send(UiEvent::Message {
+                    from: "System".to_string(),
+                    text: format!("Handshake failed: {e}"),
+                    is_system: true,
+                    ttl: None,
+                })
+                .await;
             continue;
         }
 
-        let peer_id = client.peer_node_id.clone().unwrap_or_else(|| "Unknown".to_string());
+        let peer_id = client
+            .peer_node_id
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_string());
 
         // 5.2: display identity phrase for out-of-band verification
         if let Some(phrase) = &client.identity_phrase {
@@ -218,13 +228,17 @@ async fn run_network(
             from: "System".to_string(),
             text: format!("Connection established! Our extensions: [{our_exts}]. Peer extensions: [{peer_exts}]"),
             is_system: true,
+            ttl: None,
         }).await;
 
-        let _ = ui_tx.send(UiEvent::Message {
-            from: "System".to_string(),
-            text: format!("Connected to {peer_id}"),
-            is_system: true,
-        }).await;
+        let _ = ui_tx
+            .send(UiEvent::Message {
+                from: "System".to_string(),
+                text: format!("Connected to {peer_id}"),
+                is_system: true,
+                ttl: None,
+            })
+            .await;
 
         // established: interval_at so the first tick fires after the interval, not immediately
         let mut keep_alive = time::interval_at(
@@ -242,29 +256,30 @@ async fn run_network(
         loop {
             tokio::select! {
                 msg = msg_rx.recv() => {
-                    match msg {
-                        Some(text) => {
-                            let json = serde_json::json!({ "text": text });
-                            if client.send_app_message(&mut stream, &json).await.is_err() {
-                                send_bye = false;
-                                break;
-                            }
-                        }
-                        None => break,
+                    if msg.is_none() {
+                        break;
+                    }
+
+                    if client.send_app_message(&mut stream, msg.unwrap()).await.is_err() {
+                        send_bye = false;
+                        break;
                     }
                 }
 
                 res = client.receive_message(&mut stream) => {
                     match res {
                         Ok((0x01, payload)) => {
-                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&payload)
-                                && let Some(text) = json["text"].as_str() {
-                                let _ = ui_tx.send(UiEvent::Message {
-                                    from: peer_id.clone(),
-                                    text: text.to_string(),
-                                    is_system: false,
-                                }).await;
-                            }
+                            let json = serde_json::from_slice::<serde_json::Value>(&payload).expect("Invlaid message content");
+
+                            let text = json["text"].as_str().expect("Invalid text field");
+                            let ttl = json["ttl"].as_u64();
+
+                            let _ = ui_tx.send(UiEvent::Message {
+                                from: peer_id.clone(),
+                                text: text.to_string(),
+                                is_system: false,
+                                ttl,
+                            }).await;
                         }
                         // 8.2: lumos pulse
                         Ok((0x02, payload)) => {
@@ -275,7 +290,6 @@ async fn run_network(
                                 Some(CTRL_PONG) => {
                                     pending_pong = false;
                                 }
-                                // 8.3: peer is closing gracefully
                                 Some(CTRL_BYE) => {
                                     send_bye = false;
                                     break;
@@ -283,11 +297,36 @@ async fn run_network(
                                 _ => {}
                             }
                         }
+                        Ok((0x03, payload)) => {
+                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                                if json.get("ttl_notice").is_some() {
+                                    let peer_ttl = json["ttl_notice"].as_u64();
+                                    let msg = match peer_ttl {
+                                        Some(s) => format!("Peer messages will disappear after {}", tui::format_ttl(s)),
+                                        None => "Peer disabled message TTL".to_string(),
+                                    };
+                                    let _ = ui_tx.send(UiEvent::Message {
+                                        from: "System".to_string(),
+                                        text: msg,
+                                        is_system: true,
+                                        ttl: None,
+                                    }).await;
+                                } else {
+                                    let _ = ui_tx.send(UiEvent::Message {
+                                        from: "System".to_string(),
+                                        text: format!("Got unkown extension packet data: `{}...`", json.to_string().chars().take(16).collect::<String>()),
+                                        is_system: true,
+                                        ttl: None,
+                                    }).await;
+                                }
+                            }
+                        }
                         Ok((msg_type, _)) => {
                             let _ = ui_tx.send(UiEvent::Message {
                                 from: "System".to_string(),
                                 text: format!("Unknown message type: 0x{msg_type:02x}"),
                                 is_system: true,
+                                ttl: None,
                             }).await;
                         }
                         Err(e) => {
@@ -295,6 +334,7 @@ async fn run_network(
                                 from: "System".to_string(),
                                 text: format!("Connection lost with {peer_id}: {e}"),
                                 is_system: true,
+                                ttl: None,
                             }).await;
                             send_bye = false;
                             break;
@@ -309,6 +349,7 @@ async fn run_network(
                             from: "System".to_string(),
                             text: format!("Connection timed out: {peer_id}"),
                             is_system: true,
+                            ttl: None,
                         }).await;
                         send_bye = false;
                         break;
@@ -328,10 +369,13 @@ async fn run_network(
             let _ = client.send_control_frame(&mut stream, CTRL_BYE).await;
         }
 
-        let _ = ui_tx.send(UiEvent::Message {
-            from: "System".to_string(),
-            text: format!("{peer_id} disconnected."),
-            is_system: true,
-        }).await;
+        let _ = ui_tx
+            .send(UiEvent::Message {
+                from: "System".to_string(),
+                text: format!("{peer_id} disconnected."),
+                is_system: true,
+                ttl: None,
+            })
+            .await;
     }
 }
