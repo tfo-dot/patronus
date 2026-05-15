@@ -15,6 +15,46 @@ use ratatui::{
 
 use crate::{UiEvent, OutboundMessage};
 
+// 24 hour limit on ttl since longer values are pointless
+const MAX_TTL: u64 = 24 * 3600;
+
+pub fn format_ttl(secs: u64) -> String {
+    if secs >= 86400 {
+        let d = secs / 86400;
+        let h = (secs % 86400) / 3600;
+        if h > 0 { format!("{}d {}h", d, h) } else { format!("{}d", d) }
+    } else if secs >= 3600 {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if m > 0 { format!("{}h {}m", h, m) } else { format!("{}h", h) }
+    } else if secs >= 60 {
+        let m = secs / 60;
+        let s = secs % 60;
+        if s > 0 { format!("{}m {}s", m, s) } else { format!("{}m", m) }
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// Parses a TTL string with an optional unit suffix: 30s, 5m, 2h, 1d, or a bare number (seconds).
+fn parse_ttl(s: &str) -> Result<u64, ()> {
+    if s.is_empty() {
+        return Err(());
+    }
+    let (digits, multiplier) = if let Some(n) = s.strip_suffix('d') {
+        (n, 86400u64)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600u64)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60u64)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1u64)
+    } else {
+        (s, 1u64)
+    };
+    digits.parse::<u64>().map(|n| n * multiplier).map_err(|_| ())
+}
+
 pub struct Message {
     pub from: String,
     pub content: String,
@@ -149,25 +189,80 @@ pub async fn run_app(
                             KeyCode::Enter => {
                                 if !app.input.is_empty() {
                                     let input = app.input.drain(..).collect::<String>();
-                                    
-                                    if input.starts_with("/ttl ") {
+
+                                    // fix: bare /ttl now shows current status instead of silently doing nothing
+                                    if input == "/ttl" {
+                                        let status = match app.current_ttl {
+                                            Some(s) => format!("TTL is set to {} — messages disappear after that time. Use /ttl <time> to change or /ttl 0 to disable.", format_ttl(s)),
+                                            None => "TTL is disabled — messages persist until you close the app. Use /ttl <time> to enable (e.g. /ttl 30m, /ttl 2h, /ttl 1d).".to_string(),
+                                        };
+                                        app.messages.push(Message {
+                                            from: "System".to_string(),
+                                            content: status,
+                                            is_system: true,
+                                            ttl: None,
+                                            received_at: Instant::now(),
+                                        });
+                                    } else if input.starts_with("/ttl ") {
                                         let parts: Vec<&str> = input.split_whitespace().collect();
-                                        if parts.len() == 2 {
-                                            if let Ok(ttl) = parts[1].parse::<u64>() {
-                                                if ttl == 0 {
+                                        // fix: wrong arg count now surfaces an error instead of silently doing nothing
+                                        if parts.len() != 2 {
+                                            app.messages.push(Message {
+                                                from: "System".to_string(),
+                                                content: "Usage: /ttl <time>  (e.g. 30s, 5m, 2h, 1d) or /ttl 0 to disable".to_string(),
+                                                is_system: true,
+                                                ttl: None,
+                                                received_at: Instant::now(),
+                                            });
+                                        } else {
+                                            match parse_ttl(parts[1]) {
+                                                Ok(0) => {
                                                     app.current_ttl = None;
+                                                    //ttl_notice is not part of the Patronus spec (7.3 only defines the per-message `ttl` field). This is an out-of-spec courtesy notification so the peer knows your messages are no longer set to expire.
+                                                    let _ = msg_tx.try_send(OutboundMessage {
+                                                        text: String::new(),
+                                                        ttl: None,
+                                                        is_ttl_notice: true,
+                                                    });
                                                     app.messages.push(Message {
                                                         from: "System".to_string(),
-                                                        content: "TTL disabled".to_string(),
+                                                        content: "TTL disabled — new messages will persist.".to_string(),
                                                         is_system: true,
                                                         ttl: None,
                                                         received_at: Instant::now(),
                                                     });
-                                                } else {
+                                                }
+                                                Ok(ttl) if ttl <= MAX_TTL => {
                                                     app.current_ttl = Some(ttl);
+                                                    //Same as above. This is an out-of-spec courtesy notification so the peer knows your messages are set to expire.
+                                                    let _ = msg_tx.try_send(OutboundMessage {
+                                                        text: String::new(),
+                                                        ttl: Some(ttl),
+                                                        is_ttl_notice: true,
+                                                    });
                                                     app.messages.push(Message {
                                                         from: "System".to_string(),
-                                                        content: format!("TTL set to {}s", ttl),
+                                                        content: format!("TTL set to {} — new messages will disappear after that time.", format_ttl(ttl)),
+                                                        is_system: true,
+                                                        ttl: None,
+                                                        received_at: Instant::now(),
+                                                    });
+                                                }
+                                                // fix: values above MAX_TTL now surface an error instead of silently doing nothing
+                                                Ok(_) => {
+                                                    app.messages.push(Message {
+                                                        from: "System".to_string(),
+                                                        content: format!("TTL too large — maximum is {} ({}s).", format_ttl(MAX_TTL), MAX_TTL),
+                                                        is_system: true,
+                                                        ttl: None,
+                                                        received_at: Instant::now(),
+                                                    });
+                                                }
+                                                // fix: unparseable input now surfaces an error instead of silently doing nothing
+                                                Err(()) => {
+                                                    app.messages.push(Message {
+                                                        from: "System".to_string(),
+                                                        content: format!("Invalid TTL '{}' — expected a number with an optional unit: 30s, 5m, 2h, 1d.", parts[1]),
                                                         is_system: true,
                                                         ttl: None,
                                                         received_at: Instant::now(),
@@ -175,7 +270,7 @@ pub async fn run_app(
                                                 }
                                             }
                                         }
-                                    } else if msg_tx.try_send(OutboundMessage { text: input.clone(), ttl: app.current_ttl }).is_ok() {
+                                    } else if msg_tx.try_send(OutboundMessage { text: input.clone(), ttl: app.current_ttl, is_ttl_notice: false }).is_ok() {
                                         app.messages.push(Message {
                                             from: "Me".to_string(),
                                             content: input,
@@ -337,7 +432,7 @@ fn render(f: &mut Frame, app: &App) {
     };
 
     let ttl_info = if let Some(ttl) = app.current_ttl {
-        format!(" | TTL: {}s", ttl)
+        format!(" | TTL: {}", format_ttl(ttl))
     } else {
         "".to_string()
     };
@@ -414,21 +509,13 @@ fn render(f: &mut Frame, app: &App) {
                 app.get_display_name(&msg.from)
             };
 
-            let mut spans = vec![
+            let spans = vec![
                 Span::styled(
                     format!("{}: ", display_from),
                     style.add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(&msg.content),
             ];
-
-            if let Some(ttl) = msg.ttl {
-                let remaining = ttl.saturating_sub(Instant::now().duration_since(msg.received_at).as_secs());
-                spans.push(Span::styled(
-                    format!(" ({}s)", remaining),
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::ITALIC),
-                ));
-            }
 
             ListItem::new(Line::from(spans))
         })
@@ -440,7 +527,7 @@ fn render(f: &mut Frame, app: &App) {
     let input = Paragraph::new(app.input.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Message (Esc to quit, Ctrl+B to toggle broadcast, Ctrl+R to rename peer, /ttl <s|0>)"),
+            .title("Message  (Esc: quit | Ctrl+B: broadcast | Ctrl+R: rename | /ttl [30s|5m|2h|0])"),
     );
     f.render_widget(input, main_layout[2]);
 

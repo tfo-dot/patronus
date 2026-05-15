@@ -52,6 +52,7 @@ struct Args {
 pub struct OutboundMessage {
     pub text: String,
     pub ttl: Option<u64>,
+    pub is_ttl_notice: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -255,7 +256,9 @@ async fn run_network(
                 msg = msg_rx.recv() => {
                     match msg {
                         Some(out_msg) => {
-                            let json = if let Some(ttl) = out_msg.ttl {
+                            let json = if out_msg.is_ttl_notice {
+                                serde_json::json!({ "ttl_notice": out_msg.ttl })
+                            } else if let Some(ttl) = out_msg.ttl {
                                 serde_json::json!({ "text": out_msg.text, "ttl": ttl })
                             } else {
                                 serde_json::json!({ "text": out_msg.text })
@@ -272,15 +275,29 @@ async fn run_network(
                 res = client.receive_message(&mut stream) => {
                     match res {
                         Ok((0x01, payload)) => {
-                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&payload)
-                                && let Some(text) = json["text"].as_str() {
-                                let ttl = json["ttl"].as_u64();
-                                let _ = ui_tx.send(UiEvent::Message {
-                                    from: peer_id.clone(),
-                                    text: text.to_string(),
-                                    is_system: false,
-                                    ttl,
-                                }).await;
+                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                                // This is an out-of-spec courtesy notification sent when the peer changes their TTL setting. Consider adding in a future spec revision.
+                                if json.get("ttl_notice").is_some() {
+                                    let peer_ttl = json["ttl_notice"].as_u64();
+                                    let msg = match peer_ttl {
+                                        Some(s) => format!("Peer messages will disappear after {}", tui::format_ttl(s)),
+                                        None => "Peer disabled message TTL".to_string(),
+                                    };
+                                    let _ = ui_tx.send(UiEvent::Message {
+                                        from: "System".to_string(),
+                                        text: msg,
+                                        is_system: true,
+                                        ttl: None,
+                                    }).await;
+                                } else if let Some(text) = json["text"].as_str() {
+                                    let ttl = json["ttl"].as_u64();
+                                    let _ = ui_tx.send(UiEvent::Message {
+                                        from: peer_id.clone(),
+                                        text: text.to_string(),
+                                        is_system: false,
+                                        ttl,
+                                    }).await;
+                                }
                             }
                         }
                         // 8.2: lumos pulse
