@@ -15,6 +15,122 @@ use ratatui::{
 
 use crate::UiEvent;
 
+#[derive(Clone, Debug)]
+pub struct AutocompleteState {
+    pub matches: Vec<String>,
+    pub index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutocompleteAction {
+    Path,
+    Directory,
+}
+
+pub struct AutocompleteRule {
+    pub prefix: &'static str,
+    pub action: AutocompleteAction,
+}
+
+const AUTOCOMPLETE_RULES: &[AutocompleteRule] = &[
+    AutocompleteRule { prefix: "/send ", action: AutocompleteAction::Path },
+    AutocompleteRule { prefix: "/save_dir ", action: AutocompleteAction::Directory },
+    AutocompleteRule { prefix: "/accept ", action: AutocompleteAction::Path },
+];
+
+pub fn get_autocomplete_matches(input: &str) -> Vec<String> {
+    if input.starts_with('/') && !input.contains(' ') {
+        // Complete command names
+        let mut commands = vec![
+            "/send ".to_string(),
+            "/save_dir ".to_string(),
+            "/accept ".to_string(),
+            "/decline".to_string(),
+        ];
+        // Also allow dynamic rules to be completed if they are registered
+        for rule in AUTOCOMPLETE_RULES {
+            let cmd = rule.prefix.to_string();
+            if !commands.contains(&cmd) {
+                commands.push(cmd);
+            }
+        }
+        commands
+            .into_iter()
+            .filter(|c| c.starts_with(input))
+            .collect()
+    } else {
+        // Find matching rule
+        for rule in AUTOCOMPLETE_RULES {
+            if input.starts_with(rule.prefix) {
+                let path_fragment = &input[rule.prefix.len()..];
+
+                // Split path_fragment into directory part and filename prefix
+                let (part_before_last_slash, file_prefix) = if let Some(last_slash_idx) = path_fragment.rfind('/') {
+                    (&path_fragment[..=last_slash_idx], &path_fragment[last_slash_idx + 1..])
+                } else if let Some(last_backslash_idx) = path_fragment.rfind('\\') {
+                    (&path_fragment[..=last_backslash_idx], &path_fragment[last_backslash_idx + 1..])
+                } else {
+                    ("", path_fragment)
+                };
+
+                // Expand tilde
+                let dir_to_read = if part_before_last_slash.starts_with('~') {
+                    if let Ok(home) = std::env::var("HOME") {
+                        part_before_last_slash.replacen('~', &home, 1)
+                    } else {
+                        part_before_last_slash.to_string()
+                    }
+                } else {
+                    part_before_last_slash.to_string()
+                };
+
+                let dir_path = if dir_to_read.is_empty() {
+                    std::path::PathBuf::from(".")
+                } else {
+                    std::path::PathBuf::from(&dir_to_read)
+                };
+
+                let show_hidden = file_prefix.starts_with('.');
+
+                let mut matches = Vec::new();
+                if file_prefix == "." {
+                    matches.push(format!("{}{}{}/", rule.prefix, part_before_last_slash, "."));
+                }
+                if file_prefix == ".." {
+                    matches.push(format!("{}{}{}/", rule.prefix, part_before_last_slash, ".."));
+                }
+                if let Ok(entries) = std::fs::read_dir(dir_path) {
+                    for entry in entries.flatten() {
+                        if let Ok(file_type) = entry.file_type() {
+                            // Filter for directory-only completions
+                            if rule.action == AutocompleteAction::Directory && !file_type.is_dir() {
+                                continue;
+                            }
+
+                            let file_name = entry.file_name().to_string_lossy().into_owned();
+                            if !show_hidden && file_name.starts_with('.') {
+                                continue;
+                            }
+
+                            if file_name.starts_with(file_prefix) {
+                                let mut completed = format!("{}{}{}", rule.prefix, part_before_last_slash, file_name);
+                                if file_type.is_dir() {
+                                    completed.push('/');
+                                }
+                                matches.push(completed);
+                            }
+                        }
+                    }
+                }
+
+                matches.sort();
+                return matches;
+            }
+        }
+        Vec::new()
+    }
+}
+
 pub struct App {
     pub messages: Vec<(String, String, bool)>, // (sender, content, is_system)
     pub peers: HashMap<String, (String, String)>, // (name, address)
@@ -26,6 +142,7 @@ pub struct App {
     pub rename_input: String,
     pub is_renaming: bool,
     pub broadcasting: bool,
+    pub autocomplete: Option<AutocompleteState>,
 }
 
 impl App {
@@ -41,6 +158,7 @@ impl App {
             rename_input: String::new(),
             is_renaming: false,
             broadcasting: true,
+            autocomplete: None,
         }
     }
 
@@ -127,6 +245,7 @@ pub async fn run_app(
                             KeyCode::Enter => {
                                 if !app.input.is_empty() {
                                     let input = app.input.drain(..).collect::<String>();
+                                    app.autocomplete = None;
                                     if msg_tx.try_send(input.clone()).is_ok() {
                                         app.messages.push(("Me".to_string(), input, false));
                                     }
@@ -141,6 +260,34 @@ pub async fn run_app(
                                             true,
                                         ));
                                         let _ = connect_tx.try_send(addr.clone());
+                                    }
+                                }
+                            }
+                            KeyCode::Tab | KeyCode::BackTab => {
+                                let is_backwards = key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+                                if let Some(mut state) = app.autocomplete.take() {
+                                    if !state.matches.is_empty() {
+                                        if is_backwards {
+                                            state.index = if state.index > 0 {
+                                                state.index - 1
+                                            } else {
+                                                state.matches.len() - 1
+                                            };
+                                        } else {
+                                            state.index = (state.index + 1) % state.matches.len();
+                                        }
+                                        app.input = state.matches[state.index].clone();
+                                        app.autocomplete = Some(state);
+                                    }
+                                } else {
+                                    let matches = get_autocomplete_matches(&app.input);
+                                    if !matches.is_empty() {
+                                        let index = if is_backwards { matches.len() - 1 } else { 0 };
+                                        app.input = matches[index].clone();
+                                        app.autocomplete = Some(AutocompleteState {
+                                            matches,
+                                            index,
+                                        });
                                     }
                                 }
                             }
@@ -175,9 +322,11 @@ pub async fn run_app(
                             }
                             KeyCode::Char(c) => {
                                 app.input.push(c);
+                                app.autocomplete = None;
                             }
                             KeyCode::Backspace => {
                                 app.input.pop();
+                                app.autocomplete = None;
                             }
                             KeyCode::Esc => {
                                 return Ok(());
@@ -253,12 +402,14 @@ pub async fn run_app(
 }
 
 fn render(f: &mut Frame, app: &App) {
+    let show_autocomplete = app.autocomplete.as_ref().map_or(false, |a| !a.matches.is_empty());
+    let input_height = if show_autocomplete { 4 } else { 3 };
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
         ])
         .split(f.area());
 
@@ -356,12 +507,66 @@ fn render(f: &mut Frame, app: &App) {
     let chat = List::new(messages).block(Block::default().borders(Borders::ALL).title("Chat"));
     f.render_widget(chat, middle_layout[1]);
 
-    let input = Paragraph::new(app.input.as_str()).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Message (Esc: quit | Ctrl+B: broadcast | Ctrl+R: rename | /send <file> | /accept [<path>] | /decline | /save_dir <path>)"),
-    );
-    f.render_widget(input, main_layout[2]);
+    if show_autocomplete {
+        let input_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // Suggestions bar
+                Constraint::Length(3), // Input field
+            ])
+            .split(main_layout[2]);
+
+        if let Some(state) = &app.autocomplete {
+            let mut spans = vec![Span::styled("Suggestions (Tab to cycle): ", Style::default().fg(Color::DarkGray))];
+            for (idx, m) in state.matches.iter().enumerate() {
+                if idx > 0 {
+                    spans.push(Span::raw("  "));
+                }
+                
+                let display_str = if m.starts_with('/') || m.contains('/') || m.contains('\\') {
+                    if let Some(idx) = m.rfind('/') {
+                        &m[idx+1..]
+                    } else if let Some(idx) = m.rfind('\\') {
+                        &m[idx+1..]
+                    } else {
+                        m.as_str()
+                    }
+                } else {
+                    m.as_str()
+                };
+
+                let display_str = if display_str.is_empty() { m.as_str() } else { display_str };
+
+                if idx == state.index {
+                    spans.push(Span::styled(
+                        format!("[ {} ]", display_str),
+                        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        display_str,
+                        Style::default().fg(Color::Cyan)
+                    ));
+                }
+            }
+            let suggestions = Paragraph::new(Line::from(spans));
+            f.render_widget(suggestions, input_layout[0]);
+        }
+
+        let input = Paragraph::new(app.input.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Message (Esc: quit | Ctrl+B: broadcast | Ctrl+R: rename | /send <file> | /accept [<path>] | /decline | /save_dir <path>)"),
+        );
+        f.render_widget(input, input_layout[1]);
+    } else {
+        let input = Paragraph::new(app.input.as_str()).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Message (Esc: quit | Ctrl+B: broadcast | Ctrl+R: rename | /send <file> | /accept [<path>] | /decline | /save_dir <path>)"),
+        );
+        f.render_widget(input, main_layout[2]);
+    }
 
     if app.is_renaming {
         let block = Block::default()
