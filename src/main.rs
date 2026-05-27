@@ -48,6 +48,8 @@ struct Args {
     priv_key: Option<String>,
     #[arg(short, long)]
     broadcast: Option<bool>,
+    #[arg(short, long)]
+    save_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,9 +120,10 @@ async fn main() -> Result<()> {
 
     let ui_tx_net = ui_tx.clone();
     let signing_key_net = signing_key.clone();
+    let initial_save_dir = args.save_dir.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = run_network(signing_key_net, app_port, ui_tx_net, msg_rx, connect_rx).await
+        if let Err(e) = run_network(signing_key_net, app_port, ui_tx_net, msg_rx, connect_rx, initial_save_dir).await
         {
             eprintln!("Network error: {}", e);
         }
@@ -160,6 +163,7 @@ async fn run_network(
     ui_tx: mpsc::Sender<UiEvent>,
     mut msg_rx: mpsc::Receiver<String>,
     mut connect_rx: mpsc::Receiver<String>,
+    initial_save_dir: Option<String>,
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{app_port}")).await?;
 
@@ -241,9 +245,17 @@ async fn run_network(
         // drain messages that queued up while disconnected
         while msg_rx.try_recv().is_ok() {}
 
+        let mut save_dir = initial_save_dir
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("downloads"));
+
         let mut receiving_file: Option<(tokio::fs::File, String, u64)> = None;
         let mut receiving_key: Option<[u8; 32]> = None;
         let mut receiving_bytes_seen = 0u64;
+
+        let mut pending_send_file: Option<(std::path::PathBuf, [u8; 32], String)> = None;
+        let mut pending_recv_offer: Option<FileOffer> = None;
 
         loop {
             tokio::select! {
@@ -251,6 +263,15 @@ async fn run_network(
                     match msg {
                         Some(text) => {
                             if text.starts_with("/send ") {
+                                if pending_send_file.is_some() {
+                                    let _ = ui_tx.send(UiEvent::Message {
+                                        from: "System".to_string(),
+                                        text: "A file offer is already pending response. Please wait until the peer accepts or declines.".to_string(),
+                                        is_system: true,
+                                    }).await;
+                                    continue;
+                                }
+
                                 let path_str = text.strip_prefix("/send ").unwrap().trim();
                                 let path = Path::new(path_str);
                                 if !path.exists() {
@@ -277,7 +298,6 @@ async fn run_network(
                                 let merkle_root = hasher.finalize().to_hex().to_string();
 
                                 let offer = FileOffer {
-                                    msg_type: "file-offer".to_string(),
                                     file_name: file_name.clone(),
                                     size,
                                     merkle_root: merkle_root.clone(),
@@ -294,36 +314,166 @@ async fn run_network(
 
                                 let _ = ui_tx.send(UiEvent::Message {
                                     from: "System".to_string(),
-                                    text: format!("Offering file: {file_name} ({size} bytes)"),
+                                    text: format!("Offered file: {file_name} ({size} bytes). Waiting for peer to accept/decline..."),
                                     is_system: true,
                                 }).await;
 
-                                // Derive file key and send chunks
+                                // Derive file key and store in pending
                                 let file_key = client.crypto.derive_file_key(merkle_root.as_bytes()).map_err(|e| anyhow!(e))?;
-                                
-                                file = tokio::fs::File::open(path).await?; // Re-open to start from beginning
-                                let mut chunk_buffer = vec![0u8; 16384]; // 16KB chunks
-                                let mut _sent_bytes = 0;
+                                pending_send_file = Some((path.to_path_buf(), file_key, file_name));
+                                continue;
+                            }
 
-                                while let Ok(n) = file.read(&mut chunk_buffer).await {
-                                    if n == 0 { break; }
-                                    if let Err(e) = client.send_file_chunk(&mut stream, &file_key, &chunk_buffer[..n]).await {
-                                        let _ = ui_tx.send(UiEvent::Message {
-                                            from: "System".to_string(),
-                                            text: format!("Error sending file chunk: {e}"),
-                                            is_system: true,
-                                        }).await;
-                                        break;
+                            if text.starts_with("/save_dir ") {
+                                let path_str = text.strip_prefix("/save_dir ").unwrap().trim();
+                                if path_str.is_empty() {
+                                    let _ = ui_tx.send(UiEvent::Message {
+                                        from: "System".to_string(),
+                                        text: format!("Current save directory: {}", save_dir.display()),
+                                        is_system: true,
+                                    }).await;
+                                } else {
+                                    let new_path = std::path::PathBuf::from(path_str);
+                                    match tokio::fs::create_dir_all(&new_path).await {
+                                        Ok(_) => {
+                                            save_dir = new_path;
+                                            let _ = ui_tx.send(UiEvent::Message {
+                                                from: "System".to_string(),
+                                                text: format!("Save directory set to: {}", save_dir.display()),
+                                                is_system: true,
+                                            }).await;
+                                        }
+                                        Err(e) => {
+                                            let _ = ui_tx.send(UiEvent::Message {
+                                                from: "System".to_string(),
+                                                text: format!("Failed to create/set save directory: {e}"),
+                                                is_system: true,
+                                            }).await;
+                                        }
                                     }
-                                    _sent_bytes += n as u64;
                                 }
+                                continue;
+                            }
 
+                            if text == "/save_dir" {
                                 let _ = ui_tx.send(UiEvent::Message {
                                     from: "System".to_string(),
-                                    text: format!("Finished sending {file_name}"),
+                                    text: format!("Current save directory: {}", save_dir.display()),
                                     is_system: true,
                                 }).await;
+                                continue;
+                            }
+
+                            if text.starts_with("/accept") {
+                                if pending_recv_offer.is_none() {
+                                    let _ = ui_tx.send(UiEvent::Message {
+                                        from: "System".to_string(),
+                                        text: "No pending file offer to accept.".to_string(),
+                                        is_system: true,
+                                    }).await;
+                                    continue;
+                                }
+
+                                let offer = pending_recv_offer.take().unwrap();
+                                let path_arg = text.strip_prefix("/accept").unwrap().trim();
                                 
+                                let target_path = if path_arg.is_empty() {
+                                    save_dir.join(&offer.file_name)
+                                } else {
+                                    let path = Path::new(path_arg);
+                                    if path.is_dir() || path_arg.ends_with('/') || path_arg.ends_with('\\') {
+                                        path.join(&offer.file_name)
+                                    } else {
+                                        path.to_path_buf()
+                                    }
+                                };
+
+                                // Ensure parent directory exists
+                                if let Some(parent) = target_path.parent() {
+                                    if !parent.as_os_str().is_empty() {
+                                        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                                            let _ = ui_tx.send(UiEvent::Message {
+                                                from: "System".to_string(),
+                                                text: format!("Failed to create parent directories: {e}"),
+                                                is_system: true,
+                                            }).await;
+                                            pending_recv_offer = Some(offer); // Put it back so they can try again
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                match tokio::fs::File::create(&target_path).await {
+                                    Ok(file) => {
+                                        let key = match client.crypto.derive_file_key(offer.merkle_root.as_bytes()) {
+                                            Ok(k) => k,
+                                            Err(e) => {
+                                                let _ = ui_tx.send(UiEvent::Message {
+                                                    from: "System".to_string(),
+                                                    text: format!("Key derivation failed: {e}"),
+                                                    is_system: true,
+                                                }).await;
+                                                pending_recv_offer = Some(offer);
+                                                continue;
+                                            }
+                                        };
+
+                                        let display_path = target_path.display().to_string();
+                                        let _ = ui_tx.send(UiEvent::Message {
+                                            from: "System".to_string(),
+                                            text: format!("Accepted file offer. Saving to: {display_path}. Waiting for peer to transmit..."),
+                                            is_system: true,
+                                        }).await;
+
+                                        receiving_file = Some((file, offer.file_name.clone(), offer.size));
+                                        receiving_key = Some(key);
+                                        receiving_bytes_seen = 0;
+
+                                        // Send accept frame
+                                        if let Err(e) = client.send_file_accept(&mut stream, &offer.merkle_root).await {
+                                            let _ = ui_tx.send(UiEvent::Message {
+                                                from: "System".to_string(),
+                                                text: format!("Failed to send acceptance: {e}"),
+                                                is_system: true,
+                                            }).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = ui_tx.send(UiEvent::Message {
+                                            from: "System".to_string(),
+                                            text: format!("Failed to create destination file: {e}"),
+                                            is_system: true,
+                                        }).await;
+                                        pending_recv_offer = Some(offer); // Put it back so they can try again
+                                    }
+                                }
+                                continue;
+                            }
+
+                            if text == "/decline" {
+                                if pending_recv_offer.is_none() {
+                                    let _ = ui_tx.send(UiEvent::Message {
+                                        from: "System".to_string(),
+                                        text: "No pending file offer to decline.".to_string(),
+                                        is_system: true,
+                                    }).await;
+                                    continue;
+                                }
+
+                                let offer = pending_recv_offer.take().unwrap();
+                                let _ = ui_tx.send(UiEvent::Message {
+                                    from: "System".to_string(),
+                                    text: format!("Declined file transfer of: {}", offer.file_name),
+                                    is_system: true,
+                                }).await;
+
+                                if let Err(e) = client.send_file_decline(&mut stream, &offer.merkle_root).await {
+                                    let _ = ui_tx.send(UiEvent::Message {
+                                        from: "System".to_string(),
+                                        text: format!("Failed to send decline notice: {e}"),
+                                        is_system: true,
+                                    }).await;
+                                }
                                 continue;
                             }
 
@@ -341,33 +491,94 @@ async fn run_network(
                     match res {
                         Ok((0x01, payload, _, _)) => {
                             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&payload) {
-                                if json["type"] == "file-offer" {
-                                    let offer: FileOffer = serde_json::from_value(json.clone())?;
-                                    let _ = ui_tx.send(UiEvent::Message {
-                                        from: "System".to_string(),
-                                        text: format!("Receiving file offer: {} ({} bytes)", offer.file_name, offer.size),
-                                        is_system: true,
-                                    }).await;
-
-                                    // Auto-accept and prepare for receiving
-                                    let downloads_dir = Path::new("downloads");
-                                    if !downloads_dir.exists() {
-                                        tokio::fs::create_dir_all(downloads_dir).await?;
-                                    }
-                                    let file_path = downloads_dir.join(&offer.file_name);
-                                    let file = tokio::fs::File::create(file_path).await?;
-                                    
-                                    let key = client.crypto.derive_file_key(offer.merkle_root.as_bytes()).map_err(|e| anyhow!(e))?;
-                                    
-                                    receiving_file = Some((file, offer.file_name, offer.size));
-                                    receiving_key = Some(key);
-                                    receiving_bytes_seen = 0;
-                                } else if let Some(text) = json["text"].as_str() {
+                                if let Some(text) = json["text"].as_str() {
                                     let _ = ui_tx.send(UiEvent::Message {
                                         from: peer_id.clone(),
                                         text: text.to_string(),
                                         is_system: false,
                                     }).await;
+                                }
+                            }
+                        }
+                        Ok((0x03, payload, true, _)) => {
+                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                                if let Some(offer_val) = json.get("file_offer") {
+                                    if let Ok(offer) = serde_json::from_value::<FileOffer>(offer_val.clone()) {
+                                        pending_recv_offer = Some(offer.clone());
+                                        let _ = ui_tx.send(UiEvent::Message {
+                                            from: "System".to_string(),
+                                            text: format!("Received file offer: {} ({} bytes)", offer.file_name, offer.size),
+                                            is_system: true,
+                                        }).await;
+                                        let _ = ui_tx.send(UiEvent::Message {
+                                            from: "System".to_string(),
+                                            text: "To accept, type: '/accept' or '/accept <path>'".to_string(),
+                                            is_system: true,
+                                        }).await;
+                                        let _ = ui_tx.send(UiEvent::Message {
+                                            from: "System".to_string(),
+                                            text: "To decline, type: '/decline'".to_string(),
+                                            is_system: true,
+                                        }).await;
+                                    }
+                                } else if let Some(accept_val) = json.get("file_accept") {
+                                    if let Some(_merkle_root) = accept_val.get("merkle_root").and_then(|v| v.as_str()) {
+                                        if let Some((path, file_key, file_name)) = pending_send_file.take() {
+                                            let _ = ui_tx.send(UiEvent::Message {
+                                                from: "System".to_string(),
+                                                text: format!("Peer accepted. Transmitting file: {file_name}..."),
+                                                is_system: true,
+                                            }).await;
+
+                                            // Start sending file chunks!
+                                            match tokio::fs::File::open(&path).await {
+                                                Ok(mut file) => {
+                                                    let mut chunk_buffer = vec![0u8; 16384]; // 16KB chunks
+                                                    let mut sent_bytes = 0;
+                                                    let mut error_occurred = false;
+
+                                                    while let Ok(n) = file.read(&mut chunk_buffer).await {
+                                                        if n == 0 { break; }
+                                                        if let Err(e) = client.send_file_chunk(&mut stream, &file_key, &chunk_buffer[..n]).await {
+                                                            let _ = ui_tx.send(UiEvent::Message {
+                                                                from: "System".to_string(),
+                                                                text: format!("Error sending file chunk: {e}"),
+                                                                is_system: true,
+                                                            }).await;
+                                                            error_occurred = true;
+                                                            break;
+                                                        }
+                                                        sent_bytes += n as u64;
+                                                    }
+
+                                                    if !error_occurred {
+                                                        let _ = ui_tx.send(UiEvent::Message {
+                                                            from: "System".to_string(),
+                                                            text: format!("Finished sending {file_name} ({sent_bytes} bytes)"),
+                                                            is_system: true,
+                                                        }).await;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    let _ = ui_tx.send(UiEvent::Message {
+                                                        from: "System".to_string(),
+                                                        text: format!("Failed to open file for sending: {e}"),
+                                                        is_system: true,
+                                                    }).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if let Some(decline_val) = json.get("file_decline") {
+                                    if let Some(_merkle_root) = decline_val.get("merkle_root").and_then(|v| v.as_str()) {
+                                        if let Some((_, _, file_name)) = pending_send_file.take() {
+                                            let _ = ui_tx.send(UiEvent::Message {
+                                                from: "System".to_string(),
+                                                text: format!("Peer declined file transfer of: {file_name}"),
+                                                is_system: true,
+                                            }).await;
+                                        }
+                                    }
                                 }
                             }
                         }

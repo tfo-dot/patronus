@@ -359,7 +359,7 @@ fn render(f: &mut Frame, app: &App) {
     let input = Paragraph::new(app.input.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Message (Esc to quit, Ctrl+B to toggle broadcast, Ctrl+R to rename peer)"),
+            .title("Message (Esc: quit | Ctrl+B: broadcast | Ctrl+R: rename | /send <file> | /accept [<path>] | /decline | /save_dir <path>)"),
     );
     f.render_widget(input, main_layout[2]);
 

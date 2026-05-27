@@ -22,10 +22,8 @@ pub struct HandshakePacket {
     pub extensions: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileOffer {
-    #[serde(rename = "type")]
-    pub msg_type: String,
     pub file_name: String,
     pub size: u64,
     pub merkle_root: String,
@@ -182,8 +180,39 @@ impl PatronusClient {
     where
         S: tokio::io::AsyncWrite + Unpin,
     {
-        let payload = serde_json::to_vec(offer)?;
-        let frame = self.encrypt_message(0x01, &payload)?;
+        let json = serde_json::json!({ "file_offer": offer });
+        let payload = serde_json::to_vec(&json)?;
+        let frame = self.encrypt_message(0x03, &payload)?; // 0x03: Extension Data
+        stream.write_all(&frame).await?;
+        Ok(())
+    }
+
+    pub async fn send_file_accept<S>(&mut self, stream: &mut S, merkle_root: &str) -> Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let json = serde_json::json!({
+            "file_accept": {
+                "merkle_root": merkle_root
+            }
+        });
+        let payload = serde_json::to_vec(&json)?;
+        let frame = self.encrypt_message(0x03, &payload)?; // 0x03: Extension Data
+        stream.write_all(&frame).await?;
+        Ok(())
+    }
+
+    pub async fn send_file_decline<S>(&mut self, stream: &mut S, merkle_root: &str) -> Result<()>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let json = serde_json::json!({
+            "file_decline": {
+                "merkle_root": merkle_root
+            }
+        });
+        let payload = serde_json::to_vec(&json)?;
+        let frame = self.encrypt_message(0x03, &payload)?; // 0x03: Extension Data
         stream.write_all(&frame).await?;
         Ok(())
     }
