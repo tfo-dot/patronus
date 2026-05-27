@@ -130,7 +130,9 @@ impl PatronusClient {
             .cloned();
 
         if self.selected_compression.is_none() {
-            return Err(anyhow!("Handshake Failed (0x01): No common compression algorithm"));
+            return Err(anyhow!(
+                "Handshake Failed (0x01): No common compression algorithm"
+            ));
         }
 
         // Track all agreed extensions
@@ -217,7 +219,12 @@ impl PatronusClient {
         Ok(())
     }
 
-    pub async fn send_file_chunk<S>(&mut self, stream: &mut S, key: &[u8; 32], chunk: &[u8]) -> Result<()>
+    pub async fn send_file_chunk<S>(
+        &mut self,
+        stream: &mut S,
+        key: &[u8; 32],
+        chunk: &[u8],
+    ) -> Result<()>
     where
         S: tokio::io::AsyncWrite + Unpin,
     {
@@ -238,6 +245,10 @@ impl PatronusClient {
         // Frame: 2-byte length + 4-byte 0xFFFFFFFF (sentinel for no ratchet) + 12-byte nonce + payload
         let nonce = &encrypted[..12];
         let ciphertext_and_tag = &encrypted[12..];
+
+        if u16::try_from(ciphertext_and_tag.len()).is_err() {
+            return Err(anyhow!("Ciphertext and tag length overflows u16"));
+        }
 
         let mut frame = Vec::with_capacity(2 + 4 + 12 + ciphertext_and_tag.len());
         frame.put_u16(ciphertext_and_tag.len() as u16);
@@ -329,7 +340,10 @@ impl PatronusClient {
         let ciphertext_and_tag = &encrypted[12..];
 
         if ciphertext_and_tag.len() > u16::MAX as usize {
-            return Err(anyhow!("Message too large to frame (max {} bytes)", u16::MAX));
+            return Err(anyhow!(
+                "Message too large to frame (max {} bytes)",
+                u16::MAX
+            ));
         }
         let mut frame = Vec::with_capacity(2 + 4 + 12 + ciphertext_and_tag.len());
         frame.put_u16(ciphertext_and_tag.len() as u16);
