@@ -10,8 +10,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::bytes::BufMut;
 use x25519_dalek::PublicKey;
 
-pub const SUPPORTED_EXTENSIONS: &[&str] = &["compression:zstd", "ratchet:v1", "owl-post:v1"];
+pub const SUPPORTED_EXTENSIONS: &[&str] = &["compression:zstd", "ratchet:v1", "owl-post:v1", "vanishing_ink:v1"];
 
+#[derive(Debug, Clone)]
+pub enum OutboundMessage {
+    Message { text: String, ttl: Option<u64> },
+    TTLNotice { ttl: Option<u64> },
+}
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HandshakePacket {
     #[serde(rename = "type")]
@@ -155,16 +160,27 @@ impl PatronusClient {
         Ok(())
     }
 
-    pub async fn send_app_message<S>(
-        &mut self,
-        stream: &mut S,
-        json_content: &serde_json::Value,
-    ) -> Result<()>
+    pub async fn send_app_message<S>(&mut self, stream: &mut S, msg: OutboundMessage) -> Result<()>
     where
         S: tokio::io::AsyncWrite + Unpin,
     {
-        let payload = serde_json::to_vec(json_content)?;
-        let frame = self.encrypt_message(0x01, &payload)?; // 0x01: Application Message
+        let (msg_type, json) = match msg {
+            OutboundMessage::Message { text, ttl } => {
+                let mut base = serde_json::json!({"text": text});
+
+                if let Some(val) = ttl {
+                    if let Some(obj) = base.as_object_mut() {
+                        obj.insert("ttl".to_string(), val.into());
+                    }
+                }
+
+                (0x01, base)
+            }
+            OutboundMessage::TTLNotice { ttl } => (0x03, serde_json::json!({ "ttl_notice": ttl })),
+        };
+
+        let payload = serde_json::to_vec(&json)?;
+        let frame = self.encrypt_message(msg_type, &payload)?;
         stream.write_all(&frame).await?;
         Ok(())
     }

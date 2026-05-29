@@ -119,9 +119,9 @@ Once client handshake exchange completes, the message on the wire MUST conform t
 2. **Payload:** Variable length data specific to the Message Type.
 
 The patronus specifies and acknowledges the folowing message types:
-    - `0x01`: Application Message (UTF-8 encoded JSON).
-    - `0x02`: Control Frame (Lifecycle management).
-    - `0x03`: Extension Data (e.g., File chunks).
+- `0x01`: Application Message (UTF-8 encoded JSON).
+- `0x02`: Control Frame (Lifecycle management).
+- `0x03`: Extension Data (e.g., File chunks).
 
 ### 6.3 Application Message format
 Authenticated messages MUST follow this binary structure:
@@ -171,13 +171,30 @@ Large data transfers SHOULD bypass the gossip channel in favor of direct QUIC st
 - **Framing:** Data MUST be fragmented into 16KB chunks, each independently encrypted.
 
 ### 7.3 Ephemeral Messaging (Vanishing Ink)
-Messages MAY include a `ttl` (Time-To-Live) field.
+The protocol supports ephemeral messaging through the use of a Time-To-Live (TTL) mechanism. This feature allows nodes to specify a duration after which a message should be considered expired. To facilitate exchange of TTL settings between peers, nodes MAY implement the `vanishing_ink` extension.
+
+#### 7.3.1 Extension negotiation
+- **Negotiation:** Support for this feature MUST be advertised during the handshake (Section 6.1) by including the string `"vanishing_ink:v1"` in the `extensions` array.
+- **Requirements:** A node MUST NOT include the `ttl` field and MUST NOT transmit TTL notices unless the `vanishing_ink` extension has been mutually negotiated.
+
+#### 7.3.2 TTL Field in Application Messages
+Application Messages (`0x01`) MAY include a `ttl` field within the JSON-encoded payload.
+- **Field Name:** `ttl`
+- **Type:** Unsigned Integer (seconds)
 - **Enforcement:** Receivers MUST delete the message data from local storage once `current_time > arrival_time + ttl`.
 
-### 7.4 Stealth Discovery (Invisibility Cloak)
-To prevent passive identification, nodes MAY utilize rotating discovery hashes.
-- **Hash:** `DiscoveryHash = BLAKE3(NodeID || DailySalt)`.
-- **Resolution:** Nodes MUST pre-compute hashes for known contacts to identify peers without revealing `NodeID`s to unauthorized observers.
+#### 7.3.3 TTL Notices
+When the `ink_notice` extension is active, a node SHOULD notify its peer whenever its default outgoing TTL setting changes. This is performed using an Extension Data frame (`0x03`).
+
+The payload of the Extension Data frame MUST be a JSON-encoded object with the following structure:
+```json
+{
+  "ttl_notice": <u64_or_null>
+}
+```
+- **ttl_notice:** The new TTL value in seconds, or `null` if TTL is being disabled.
+
+Upon receiving a valid `ttl_notice`, the implementation SHOULD update the user interface to reflect the peer's current ephemeral messaging status.
 
 ### 7.5 Message Compression (The Reducio Charm)
 To optimize bandwidth utilization and improve protocol efficiency, nodes MUST implement and utilize transparent payload compression.
