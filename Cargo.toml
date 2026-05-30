@@ -24,3 +24,5 @@ ssh-key = {version = "0.6.7", features = ["ed25519"]}
 zstd = "0.13.3"
 tokio-util = { version = "0.7.18", features = ["codec"] }
 directories = "6.0.0"
+get_if_addrs = "0.5.3"
+

@@ -169,11 +169,7 @@ impl CryptoState {
         out
     }
 
-    pub fn decrypt_with_key(
-        &self,
-        key: &[u8; 32],
-        data: &[u8],
-    ) -> Result<Vec<u8>, &'static str> {
+    pub fn decrypt_with_key(&self, key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>, &'static str> {
         let session = self.session.as_ref().ok_or("handshake not completed")?;
         let aad = Self::compute_aad(&session.topic_id);
         let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| "invalid key length")?;

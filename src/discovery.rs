@@ -13,6 +13,7 @@ const DISCOVERY_PORT: u16 = 8888;
 pub struct DiscoveryService {
     app_port: u16,
     node_id: String,
+    bind_ip: std::net::IpAddr,
 
     is_running: Arc<AtomicBool>,
     broadcasting: Arc<AtomicBool>,
@@ -20,10 +21,11 @@ pub struct DiscoveryService {
 }
 
 impl DiscoveryService {
-    pub fn new(app_port: u16, node_id: String) -> Self {
+    pub fn new(app_port: u16, node_id: String, bind_ip: std::net::IpAddr) -> Self {
         Self {
             app_port,
             node_id,
+            bind_ip,
 
             is_running: Arc::new(AtomicBool::new(false)),
             broadcasting: Arc::new(AtomicBool::new(true)),
@@ -61,12 +63,13 @@ impl DiscoveryService {
 
         let app_port = self.app_port;
         let node_id = self.node_id.clone();
+        let bind_ip = self.bind_ip;
 
         let is_running = Arc::clone(&self.is_running);
         let broadcasting = Arc::clone(&self.broadcasting);
 
         thread::spawn(move || {
-            let socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to bind broadcaster");
+            let socket = UdpSocket::bind(format!("{}:0", bind_ip)).expect("Failed to bind broadcaster");
             socket
                 .set_broadcast(true)
                 .expect("Failed to set broadcast flag");

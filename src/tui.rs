@@ -1,7 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use anyhow::Result;
 use crate::discovery::DiscoveryService;
+use anyhow::Result;
 use tokio::sync::mpsc;
 
 use ratatui::{
@@ -13,24 +17,35 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 
-use crate::{UiEvent, OutboundMessage};
+use crate::{OutboundMessage, UiEvent};
 
-// 24 hour limit on ttl since longer values are pointless
 const MAX_TTL: u64 = 24 * 3600;
 
 pub fn format_ttl(secs: u64) -> String {
     if secs >= 86400 {
         let d = secs / 86400;
         let h = (secs % 86400) / 3600;
-        if h > 0 { format!("{}d {}h", d, h) } else { format!("{}d", d) }
+        if h > 0 {
+            format!("{}d {}h", d, h)
+        } else {
+            format!("{}d", d)
+        }
     } else if secs >= 3600 {
         let h = secs / 3600;
         let m = (secs % 3600) / 60;
-        if m > 0 { format!("{}h {}m", h, m) } else { format!("{}h", h) }
+        if m > 0 {
+            format!("{}h {}m", h, m)
+        } else {
+            format!("{}h", h)
+        }
     } else if secs >= 60 {
         let m = secs / 60;
         let s = secs % 60;
-        if s > 0 { format!("{}m {}s", m, s) } else { format!("{}m", m) }
+        if s > 0 {
+            format!("{}m {}s", m, s)
+        } else {
+            format!("{}m", m)
+        }
     } else {
         format!("{}s", secs)
     }
@@ -47,7 +62,6 @@ fn parse_ttl(s: &str) -> Result<u64, ()> {
 
     for c in s.chars() {
         if let Some(digit) = c.to_digit(10) {
-
             current_val = current_val
                 .checked_mul(10)
                 .and_then(|v| v.checked_add(digit as u64))
@@ -68,7 +82,7 @@ fn parse_ttl(s: &str) -> Result<u64, ()> {
 
             let chunk = current_val.checked_mul(multiplier).ok_or(())?;
             total = total.checked_add(chunk).ok_or(())?;
-            
+
             current_val = 0;
             num_started = false;
         }
@@ -107,9 +121,18 @@ pub struct AutocompleteRule {
 }
 
 const AUTOCOMPLETE_RULES: &[AutocompleteRule] = &[
-    AutocompleteRule { prefix: "/send ", action: AutocompleteAction::Path },
-    AutocompleteRule { prefix: "/save_dir ", action: AutocompleteAction::Directory },
-    AutocompleteRule { prefix: "/accept ", action: AutocompleteAction::Path },
+    AutocompleteRule {
+        prefix: "/send ",
+        action: AutocompleteAction::Path,
+    },
+    AutocompleteRule {
+        prefix: "/save_dir ",
+        action: AutocompleteAction::Directory,
+    },
+    AutocompleteRule {
+        prefix: "/accept ",
+        action: AutocompleteAction::Path,
+    },
 ];
 
 pub fn get_autocomplete_matches(input: &str) -> Vec<String> {
@@ -121,7 +144,7 @@ pub fn get_autocomplete_matches(input: &str) -> Vec<String> {
             "/accept ".to_string(),
             "/decline".to_string(),
         ];
-        // Also allow dynamic rules to be completed if they are registered
+
         for rule in AUTOCOMPLETE_RULES {
             let cmd = rule.prefix.to_string();
             if !commands.contains(&cmd) {
@@ -139,13 +162,20 @@ pub fn get_autocomplete_matches(input: &str) -> Vec<String> {
                 let path_fragment = &input[rule.prefix.len()..];
 
                 // Split path_fragment into directory part and filename prefix
-                let (part_before_last_slash, file_prefix) = if let Some(last_slash_idx) = path_fragment.rfind('/') {
-                    (&path_fragment[..=last_slash_idx], &path_fragment[last_slash_idx + 1..])
-                } else if let Some(last_backslash_idx) = path_fragment.rfind('\\') {
-                    (&path_fragment[..=last_backslash_idx], &path_fragment[last_backslash_idx + 1..])
-                } else {
-                    ("", path_fragment)
-                };
+                let (part_before_last_slash, file_prefix) =
+                    if let Some(last_slash_idx) = path_fragment.rfind('/') {
+                        (
+                            &path_fragment[..=last_slash_idx],
+                            &path_fragment[last_slash_idx + 1..],
+                        )
+                    } else if let Some(last_backslash_idx) = path_fragment.rfind('\\') {
+                        (
+                            &path_fragment[..=last_backslash_idx],
+                            &path_fragment[last_backslash_idx + 1..],
+                        )
+                    } else {
+                        ("", path_fragment)
+                    };
 
                 // Expand tilde
                 let dir_to_read = if part_before_last_slash.starts_with('~') {
@@ -171,7 +201,10 @@ pub fn get_autocomplete_matches(input: &str) -> Vec<String> {
                     matches.push(format!("{}{}{}/", rule.prefix, part_before_last_slash, "."));
                 }
                 if file_prefix == ".." {
-                    matches.push(format!("{}{}{}/", rule.prefix, part_before_last_slash, ".."));
+                    matches.push(format!(
+                        "{}{}{}/",
+                        rule.prefix, part_before_last_slash, ".."
+                    ));
                 }
                 if let Ok(entries) = std::fs::read_dir(dir_path) {
                     for entry in entries.flatten() {
@@ -187,7 +220,10 @@ pub fn get_autocomplete_matches(input: &str) -> Vec<String> {
                             }
 
                             if file_name.starts_with(file_prefix) {
-                                let mut completed = format!("{}{}{}", rule.prefix, part_before_last_slash, file_name);
+                                let mut completed = format!(
+                                    "{}{}{}",
+                                    rule.prefix, part_before_last_slash, file_name
+                                );
                                 if file_type.is_dir() {
                                     completed.push('/');
                                 }
@@ -218,6 +254,8 @@ pub struct App {
     pub broadcasting: bool,
     pub autocomplete: Option<AutocompleteState>,
     pub current_ttl: Option<u64>,
+    pub selected_interface: Option<(String, std::net::IpAddr)>,
+    pub default_interface: Option<(String, std::net::IpAddr)>,
 }
 
 impl App {
@@ -235,6 +273,8 @@ impl App {
             broadcasting: true,
             autocomplete: None,
             current_ttl: None,
+            selected_interface: None,
+            default_interface: None,
         }
     }
 
@@ -256,12 +296,10 @@ impl App {
 
     pub fn cleanup_expired_messages(&mut self) {
         let now = Instant::now();
+
         self.messages.retain(|msg| {
-            if let Some(ttl) = msg.ttl {
-                now.duration_since(msg.received_at) < Duration::from_secs(ttl)
-            } else {
-                true
-            }
+            msg.ttl
+                .is_none_or(|ttl| now.duration_since(msg.received_at) < Duration::from_secs(ttl))
         });
     }
 }
@@ -333,9 +371,9 @@ pub async fn run_app(
                             KeyCode::Enter => {
                                 if !app.input.is_empty() {
                                     let input = app.input.drain(..).collect::<String>();
-                                  
+
                                     app.autocomplete = None;
-                                  
+
                                     if input == "/ttl" {
                                         let status = match app.current_ttl {
                                             Some(s) => format!("TTL is set to {} — messages disappear after that time. Use /ttl <time> to change or /ttl 0 to disable.", format_ttl(s)),
@@ -363,8 +401,10 @@ pub async fn run_app(
                                             match parse_ttl(parts[1]) {
                                                 Ok(0) => {
                                                     app.current_ttl = None;
-                                                    
-                                                    let _ = msg_tx.try_send(OutboundMessage::TTLNotice { ttl: None });
+
+                                                    let _ = msg_tx.try_send(
+                                                        OutboundMessage::TTLNotice { ttl: None },
+                                                    );
 
                                                     app.messages.push(Message {
                                                         from: "System".to_string(),
@@ -377,7 +417,11 @@ pub async fn run_app(
                                                 Ok(ttl) if ttl <= MAX_TTL => {
                                                     app.current_ttl = Some(ttl);
 
-                                                    let _ = msg_tx.try_send(OutboundMessage::TTLNotice { ttl: Some(ttl) });
+                                                    let _ = msg_tx.try_send(
+                                                        OutboundMessage::TTLNotice {
+                                                            ttl: Some(ttl),
+                                                        },
+                                                    );
 
                                                     app.messages.push(Message {
                                                         from: "System".to_string(),
@@ -391,7 +435,11 @@ pub async fn run_app(
                                                 Ok(_) => {
                                                     app.messages.push(Message {
                                                         from: "System".to_string(),
-                                                        content: format!("TTL too large — maximum is {} ({}s).", format_ttl(MAX_TTL), MAX_TTL),
+                                                        content: format!(
+                                                            "TTL too large — maximum is {} ({}s).",
+                                                            format_ttl(MAX_TTL),
+                                                            MAX_TTL
+                                                        ),
                                                         is_system: true,
                                                         ttl: None,
                                                         received_at: Instant::now(),
@@ -409,7 +457,13 @@ pub async fn run_app(
                                                 }
                                             }
                                         }
-                                    } else if msg_tx.try_send(OutboundMessage::Message { text: input.clone(), ttl: app.current_ttl }).is_ok() {
+                                    } else if msg_tx
+                                        .try_send(OutboundMessage::Message {
+                                            text: input.clone(),
+                                            ttl: app.current_ttl,
+                                        })
+                                        .is_ok()
+                                    {
                                         app.messages.push(Message {
                                             from: "Me".to_string(),
                                             content: input,
@@ -435,7 +489,8 @@ pub async fn run_app(
                                 }
                             }
                             KeyCode::Tab | KeyCode::BackTab => {
-                                let is_backwards = key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+                                let is_backwards = key.code == KeyCode::BackTab
+                                    || key.modifiers.contains(KeyModifiers::SHIFT);
                                 if let Some(mut state) = app.autocomplete.take() {
                                     if !state.matches.is_empty() {
                                         if is_backwards {
@@ -453,12 +508,11 @@ pub async fn run_app(
                                 } else {
                                     let matches = get_autocomplete_matches(&app.input);
                                     if !matches.is_empty() {
-                                        let index = if is_backwards { matches.len() - 1 } else { 0 };
+                                        let index =
+                                            if is_backwards { matches.len() - 1 } else { 0 };
                                         app.input = matches[index].clone();
-                                        app.autocomplete = Some(AutocompleteState {
-                                            matches,
-                                            index,
-                                        });
+                                        app.autocomplete =
+                                            Some(AutocompleteState { matches, index });
                                     }
                                 }
                             }
@@ -580,7 +634,10 @@ pub async fn run_app(
 }
 
 fn render(f: &mut Frame, app: &App) {
-    let show_autocomplete = app.autocomplete.as_ref().map_or(false, |a| !a.matches.is_empty());
+    let show_autocomplete = app
+        .autocomplete
+        .as_ref()
+        .map_or(false, |a| !a.matches.is_empty());
     let input_height = if show_autocomplete { 4 } else { 3 };
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -608,6 +665,14 @@ fn render(f: &mut Frame, app: &App) {
         "".to_string()
     };
 
+    let interface_info = if let Some((name, ip)) = &app.selected_interface {
+        format!(" | Interface: {} ({})", name, ip)
+    } else if let Some((name, ip)) = &app.default_interface {
+        format!(" | Interface: All (0.0.0.0) [default: {} ({})]", name, ip)
+    } else {
+        " | Interface: All (0.0.0.0)".to_string()
+    };
+
     let info_text = vec![Line::from(vec![
         Span::styled("Identity: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(identity, Style::default().fg(Color::Cyan)),
@@ -615,6 +680,7 @@ fn render(f: &mut Frame, app: &App) {
         Span::styled("Broadcast: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(broadcast_label, Style::default().fg(broadcast_color)),
         Span::raw(ttl_info),
+        Span::raw(interface_info),
     ])];
     let info = Paragraph::new(info_text).block(
         Block::default()
@@ -625,10 +691,7 @@ fn render(f: &mut Frame, app: &App) {
 
     let middle_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(75),
-        ])
+        .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
         .split(main_layout[1]);
 
     let peers: Vec<ListItem> = app
@@ -705,17 +768,20 @@ fn render(f: &mut Frame, app: &App) {
             .split(main_layout[2]);
 
         if let Some(state) = &app.autocomplete {
-            let mut spans = vec![Span::styled("Suggestions (Tab to cycle): ", Style::default().fg(Color::DarkGray))];
+            let mut spans = vec![Span::styled(
+                "Suggestions (Tab to cycle): ",
+                Style::default().fg(Color::DarkGray),
+            )];
             for (idx, m) in state.matches.iter().enumerate() {
                 if idx > 0 {
                     spans.push(Span::raw("  "));
                 }
-                
+
                 let display_str = if m.starts_with('/') || m.contains('/') || m.contains('\\') {
                     if let Some(idx) = m.rfind('/') {
-                        &m[idx+1..]
+                        &m[idx + 1..]
                     } else if let Some(idx) = m.rfind('\\') {
-                        &m[idx+1..]
+                        &m[idx + 1..]
                     } else {
                         m.as_str()
                     }
@@ -723,18 +789,22 @@ fn render(f: &mut Frame, app: &App) {
                     m.as_str()
                 };
 
-                let display_str = if display_str.is_empty() { m.as_str() } else { display_str };
+                let display_str = if display_str.is_empty() {
+                    m.as_str()
+                } else {
+                    display_str
+                };
 
                 if idx == state.index {
                     spans.push(Span::styled(
                         format!("[ {} ]", display_str),
-                        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
                     ));
                 } else {
-                    spans.push(Span::styled(
-                        display_str,
-                        Style::default().fg(Color::Cyan)
-                    ));
+                    spans.push(Span::styled(display_str, Style::default().fg(Color::Cyan)));
                 }
             }
             let suggestions = Paragraph::new(Line::from(spans));
