@@ -85,6 +85,7 @@ pub struct FileOffer {
 pub struct PatronusClient {
     pub crypto: CryptoState,
     pub peer_node_id: Option<String>,
+    pub peer_static_pk: Option<String>,
     pub identity_phrase: Option<String>,
     pub selected_compression: Option<String>,
     pub active_extensions: Vec<String>,
@@ -112,6 +113,7 @@ impl PatronusClient {
         Self {
             crypto: CryptoState::new(static_key),
             peer_node_id: None,
+            peer_static_pk: None,
             identity_phrase: None,
             selected_compression: None,
             active_extensions: Vec::new(),
@@ -243,6 +245,7 @@ impl PatronusClient {
 
         self.identity_phrase = Some(phrase);
         self.peer_node_id = Some(peer_node_id_str);
+        self.peer_static_pk = Some(BASE64.encode(peer_static_pk.as_bytes()));
 
         Ok(())
     }

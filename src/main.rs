@@ -86,7 +86,22 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let pk = match args.priv_key {
-        Some(p) => PrivateKey::read_openssh_file(Path::new(&p)),
+        Some(p) => {
+            let expanded_path = if p.starts_with("~/") {
+                if let Ok(home) = std::env::var("HOME") {
+                    p.replacen("~/", &format!("{}/", home), 1)
+                } else {
+                    p.clone()
+                }
+            } else if p == "~" {
+                std::env::var("HOME").unwrap_or(p.clone())
+            } else {
+                p.clone()
+            };
+            let path = Path::new(&expanded_path);
+            PrivateKey::read_openssh_file(path)
+                .map_err(|e| anyhow::anyhow!("Failed to read private key from '{}': {}", path.display(), e))?
+        }
         None => {
             let pd = ProjectDirs::from("com", "patronus", "patronus")
                 .expect("No valid user OS profile found");
@@ -101,6 +116,7 @@ async fn main() -> Result<()> {
 
             if fp.exists() {
                 PrivateKey::read_openssh_file(&fp)
+                    .map_err(|e| anyhow::anyhow!("Failed to read private key from config '{}': {}", fp.display(), e))?
             } else {
                 let pk = PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
 
@@ -111,13 +127,12 @@ async fn main() -> Result<()> {
                 let line_ending = LineEnding::LF;
 
                 PrivateKey::write_openssh_file(&pk, &fp, line_ending)
-                    .expect("Error writing new random key");
+                    .map_err(|e| anyhow::anyhow!("Failed to write new private key to '{}': {}", fp.display(), e))?;
 
-                Ok(pk)
+                pk
             }
         }
-    }
-    .unwrap();
+    };
 
     let ed_sk = pk.key_data().ed25519().expect("Ed25519 key required");
     let signing_key = SigningKey::from_bytes(ed_sk.private.as_ref());
@@ -355,7 +370,7 @@ async fn run_network(
                 let mut map = trusted_peers_task.lock().unwrap();
                 if !map.contains_key(&peer_id) {
                     map.insert(peer_id.clone(), storage::PeerInfo {
-                        static_public_key_b64: BASE64.encode(client.crypto.static_public().as_bytes()),
+                        static_public_key_b64: client.peer_static_pk.clone().unwrap_or_default(),
                         custom_name: None,
                         is_verified: false,
                     });
