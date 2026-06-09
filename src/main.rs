@@ -1,9 +1,10 @@
 mod client;
 mod crypto;
 mod discovery;
+mod storage;
 mod tui;
 
-use std::{fs, path::Path, sync::Arc, net::IpAddr};
+use std::{fs, path::Path, sync::Arc, net::IpAddr, collections::HashMap};
 
 use anyhow::Result;
 use clap::Parser;
@@ -74,6 +75,7 @@ macro_rules! sys_msg {
             text: format!($($arg)*),
             is_system: true,
             ttl: None,
+            group: None,
         }
     };
 }
@@ -133,9 +135,49 @@ async fn main() -> Result<()> {
         }
     };
 
+    let pd = ProjectDirs::from("com", "patronus", "patronus")
+        .expect("No valid user OS profile found");
+    let config_dir = pd.config_dir().to_path_buf();
+    if !config_dir.exists() {
+        fs::create_dir_all(&config_dir).ok();
+    }
+
+    let storage_key = storage::derive_storage_key(signing_key.to_bytes().as_ref());
+
     let mut app = App::new();
     app.selected_interface = selected_interface;
     app.default_interface = get_default_interface();
+    app.storage_key = Some(storage_key);
+    app.config_dir = Some(config_dir.clone());
+
+    // Load persisted peers and history
+    let loaded_peers = storage::load_peers(&config_dir, &storage_key).unwrap_or_default();
+    let loaded_history = storage::load_history(&config_dir, &storage_key).unwrap_or_default();
+
+    // Initialize custom names and peers map
+    let mut peer_ids: Vec<String> = loaded_peers.keys().cloned().collect();
+    peer_ids.sort();
+    app.peer_ids = vec!["__group__".to_string()];
+    app.peer_ids.extend(peer_ids);
+
+    app.peers.insert("__group__".to_string(), ("Lobby (Group Chat)".to_string(), "".to_string()));
+    for (id, peer_info) in &loaded_peers {
+        if let Some(name) = &peer_info.custom_name {
+            app.custom_names.insert(id.clone(), name.clone());
+        }
+        let name = peer_info.custom_name.clone().unwrap_or_else(|| id.chars().take(8).collect());
+        app.peers.insert(id.clone(), (name, "Offline".to_string()));
+    }
+
+    for msg in loaded_history {
+        app.messages.entry(msg.peer_id).or_default().push(tui::Message {
+            from: msg.from,
+            content: msg.content,
+            is_system: msg.is_system,
+            ttl: msg.ttl,
+            received_at: std::time::Instant::now(),
+        });
+    }
 
     let (ui_tx, ui_rx) = mpsc::channel(100);
     let (msg_tx, msg_rx) = mpsc::channel::<OutboundMessage>(100);
@@ -146,6 +188,8 @@ async fn main() -> Result<()> {
     let ui_tx_net = ui_tx.clone();
     let signing_key_net = signing_key.clone();
     let initial_save_dir = args.save_dir.clone();
+    let config_dir_net = config_dir.clone();
+    let storage_key_net = storage_key.clone();
 
     tokio::spawn(async move {
         if let Err(e) = run_network(
@@ -156,6 +200,8 @@ async fn main() -> Result<()> {
             msg_rx,
             connect_rx,
             initial_save_dir,
+            config_dir_net,
+            storage_key_net,
         )
         .await
         {
@@ -198,95 +244,196 @@ async fn run_network(
     mut msg_rx: mpsc::Receiver<OutboundMessage>,
     mut connect_rx: mpsc::Receiver<String>,
     initial_save_dir: Option<String>,
+    config_dir: std::path::PathBuf,
+    storage_key: [u8; 32],
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(format!("{bind_ip}:{app_port}")).await?;
 
-    loop {
-        let (mut stream, is_initiator, peer_addr) = loop {
-            tokio::select! {
-                incoming = listener.accept() => {
-                    if let Ok((stream, addr)) = incoming {
-                        break (stream, false, addr.to_string());
-                    }
-                }
-                addr = connect_rx.recv() => {
-                    if let Some(addr) = addr {
-                        match tokio::net::TcpStream::connect(&addr).await {
-                            Ok(stream) => break (stream, true, addr),
-                            Err(e) => {
-                                let _ = ui_tx.send(sys_msg!("Connection to {addr} failed: {e}")).await;
-                            }
+    let trusted_peers = Arc::new(std::sync::Mutex::new(
+        storage::load_peers(&config_dir, &storage_key).unwrap_or_default()
+    ));
+
+    let active_conns = Arc::new(std::sync::Mutex::new(
+        HashMap::<String, mpsc::Sender<OutboundMessage>>::new()
+    ));
+
+    let active_conns_clone = active_conns.clone();
+    let ui_tx_clone = ui_tx.clone();
+
+    tokio::spawn(async move {
+        while let Some(msg) = msg_rx.recv().await {
+            match msg {
+                OutboundMessage::Message { target, text, ttl } => {
+                    if target == "__group__" {
+                        let senders: Vec<(String, mpsc::Sender<OutboundMessage>)> = {
+                            let conns = active_conns_clone.lock().unwrap();
+                            conns.iter().map(|(id, s)| (id.clone(), s.clone())).collect()
+                        };
+                        for (peer_id, sender) in senders {
+                            let _ = sender.send(OutboundMessage::Message {
+                                target: peer_id,
+                                text: text.clone(),
+                                ttl,
+                            }).await;
+                        }
+                    } else {
+                        let sender = {
+                            let conns = active_conns_clone.lock().unwrap();
+                            conns.get(&target).cloned()
+                        };
+                        if let Some(sender) = sender {
+                            let _ = sender.send(OutboundMessage::Message {
+                                target: target.clone(),
+                                text,
+                                ttl,
+                            }).await;
+                        } else {
+                            let _ = ui_tx_clone.send(sys_msg!("Peer {} is not connected.", target)).await;
                         }
                     }
+                }
+                OutboundMessage::TTLNotice { target, ttl } => {
+                    let sender = {
+                        let conns = active_conns_clone.lock().unwrap();
+                        conns.get(&target).cloned()
+                    };
+                    if let Some(sender) = sender {
+                        let _ = sender.send(OutboundMessage::TTLNotice { target, ttl }).await;
+                    }
+                }
+            }
+        }
+    });
+
+    loop {
+        let (mut stream, is_initiator, peer_addr) = tokio::select! {
+            incoming = listener.accept() => {
+                match incoming {
+                    Ok((stream, addr)) => (stream, false, addr.to_string()),
+                    Err(_) => continue,
+                }
+            }
+            addr = connect_rx.recv() => {
+                if let Some(addr) = addr {
+                    match tokio::net::TcpStream::connect(&addr).await {
+                        Ok(stream) => (stream, true, addr),
+                        Err(e) => {
+                            let _ = ui_tx.send(sys_msg!("Connection to {addr} failed: {e}")).await;
+                            continue;
+                        }
+                    }
+                } else {
+                    break;
                 }
             }
         };
 
-        let mut client = client::PatronusClient::new(signing_key.clone(), initial_save_dir.clone());
+        let signing_key_clone = signing_key.clone();
+        let initial_save_dir_clone = initial_save_dir.clone();
+        let ui_tx_task = ui_tx.clone();
+        let trusted_peers_task = trusted_peers.clone();
+        let active_conns_task = active_conns.clone();
+        let config_dir_task = config_dir.clone();
+        let storage_key_task = storage_key.clone();
 
-        if let Err(e) = client.handshake(&mut stream, is_initiator).await {
-            let _ = ui_tx.send(sys_msg!("Handshake failed: {e}")).await;
-            continue;
-        }
+        tokio::spawn(async move {
+            let mut client = client::PatronusClient::new(signing_key_clone, initial_save_dir_clone);
 
-        let peer_id = client
-            .peer_node_id
-            .clone()
-            .unwrap_or_else(|| "Unknown".to_string());
+            let trusted_peers_map = {
+                let map = trusted_peers_task.lock().unwrap();
+                map.clone()
+            };
 
-        if let Some(phrase) = &client.identity_phrase {
-            let _ = ui_tx.send(UiEvent::HandshakeComplete(phrase.clone())).await;
-        }
+            if let Err(e) = client.handshake(&mut stream, is_initiator, &trusted_peers_map).await {
+                let _ = ui_tx_task.send(sys_msg!("Handshake failed: {e}")).await;
+                return;
+            }
 
-        let _ = ui_tx.try_send(UiEvent::PeerUpdate {
-            id: peer_id.clone(),
-            name: peer_id.chars().take(8).collect(),
-            addr: peer_addr,
-        });
+            let peer_id = client.peer_node_id.clone().unwrap_or_else(|| "Unknown".to_string());
 
-        let our_exts = client::SUPPORTED_EXTENSIONS.join(", ");
-        let peer_exts = client.peer_extensions.join(", ");
-
-        let _ = ui_tx.send(sys_msg!(
-            "Connection established! Our extensions: [{our_exts}]. Peer extensions: [{peer_exts}]"
-        )).await;
-
-        let _ = ui_tx.send(sys_msg!("Connected to {peer_id}")).await;
-
-        let mut keep_alive = time::interval_at(
-            time::Instant::now() + client::KEEP_ALIVE_INTERVAL,
-            client::KEEP_ALIVE_INTERVAL,
-        );
-
-        while msg_rx.try_recv().is_ok() {}
-
-        loop {
-            tokio::select! {
-                msg = msg_rx.recv() => {
-                    if msg.is_none() {
-                        break;
-                    }
-                    if client.handle_outbound_msg(&mut stream, msg.unwrap(), &ui_tx).await.is_err() {
-                        break;
-                    }
+            {
+                let mut map = trusted_peers_task.lock().unwrap();
+                if !map.contains_key(&peer_id) {
+                    map.insert(peer_id.clone(), storage::PeerInfo {
+                        static_public_key_b64: BASE64.encode(client.crypto.static_public().as_bytes()),
+                        custom_name: None,
+                        is_verified: false,
+                    });
+                    let _ = storage::save_peers(&config_dir_task, &storage_key_task, &map);
                 }
+            }
 
-                res = client.handle_incoming(&mut stream, &ui_tx) => {
-                    if res.is_err() {
-                        break;
+            if let Some(phrase) = &client.identity_phrase {
+                let _ = ui_tx_task.send(UiEvent::HandshakeComplete(phrase.clone())).await;
+            }
+
+            let _ = ui_tx_task.send(UiEvent::PeerUpdate {
+                id: peer_id.clone(),
+                name: peer_id.chars().take(8).collect(),
+                addr: peer_addr.clone(),
+            }).await;
+
+            let our_exts = client::SUPPORTED_EXTENSIONS.join(", ");
+            let peer_exts = client.peer_extensions.join(", ");
+
+            let _ = ui_tx_task.send(sys_msg!(
+                "Connection established! Our extensions: [{our_exts}]. Peer extensions: [{peer_exts}]"
+            )).await;
+
+            let _ = ui_tx_task.send(sys_msg!("Connected to {peer_id}")).await;
+
+            let (peer_tx, mut peer_rx) = mpsc::channel::<OutboundMessage>(100);
+
+            {
+                let mut conns = active_conns_task.lock().unwrap();
+                conns.insert(peer_id.clone(), peer_tx);
+            }
+
+            let mut keep_alive = time::interval_at(
+                time::Instant::now() + client::KEEP_ALIVE_INTERVAL,
+                client::KEEP_ALIVE_INTERVAL,
+            );
+
+            loop {
+                tokio::select! {
+                    msg = peer_rx.recv() => {
+                        if msg.is_none() {
+                            break;
+                        }
+                        if client.handle_outbound_msg(&mut stream, msg.unwrap(), &ui_tx_task).await.is_err() {
+                            break;
+                        }
                     }
-                }
 
-                _ = keep_alive.tick() => {
-                    if client.tick_keep_alive(&mut stream, &ui_tx).await.is_err() {
-                        break;
+                    res = client.handle_incoming(&mut stream, &ui_tx_task) => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+
+                    _ = keep_alive.tick() => {
+                        if client.tick_keep_alive(&mut stream, &ui_tx_task).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
-        }
 
-        let _ = client.disconnect(&mut stream).await;
+            let _ = client.disconnect(&mut stream).await;
 
-        let _ = ui_tx.send(sys_msg!("{peer_id} disconnected.")).await;
+            {
+                let mut conns = active_conns_task.lock().unwrap();
+                conns.remove(&peer_id);
+            }
+
+            let _ = ui_tx_task.send(sys_msg!("{peer_id} disconnected.")).await;
+            let _ = ui_tx_task.send(UiEvent::PeerUpdate {
+                id: peer_id.clone(),
+                name: peer_id.chars().take(8).collect(),
+                addr: "Offline".to_string(),
+            }).await;
+        });
     }
+
+    Ok(())
 }

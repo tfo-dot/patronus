@@ -95,6 +95,7 @@ fn parse_ttl(s: &str) -> Result<u64, ()> {
     Ok(total)
 }
 
+#[derive(Clone)]
 pub struct Message {
     pub from: String,
     pub content: String,
@@ -143,6 +144,8 @@ pub fn get_autocomplete_matches(input: &str) -> Vec<String> {
             "/save_dir ".to_string(),
             "/accept ".to_string(),
             "/decline".to_string(),
+            "/connect ".to_string(),
+            "/ttl ".to_string(),
         ];
 
         for rule in AUTOCOMPLETE_RULES {
@@ -241,8 +244,16 @@ pub fn get_autocomplete_matches(input: &str) -> Vec<String> {
     }
 }
 
+pub struct FileTransfer {
+    pub file_name: String,
+    pub total_size: u64,
+    pub bytes_transferred: u64,
+    pub is_sending: bool,
+    pub start_time: Instant,
+}
+
 pub struct App {
-    pub messages: Vec<Message>,
+    pub messages: HashMap<String, Vec<Message>>,
     pub peers: HashMap<String, (String, String)>, // (name, address)
     pub peer_ids: Vec<String>,
     pub custom_names: HashMap<String, String>,
@@ -256,14 +267,17 @@ pub struct App {
     pub current_ttl: Option<u64>,
     pub selected_interface: Option<(String, std::net::IpAddr)>,
     pub default_interface: Option<(String, std::net::IpAddr)>,
+    pub storage_key: Option<[u8; 32]>,
+    pub config_dir: Option<std::path::PathBuf>,
+    pub active_file_transfers: HashMap<String, FileTransfer>,
 }
 
 impl App {
     pub fn new() -> Self {
-        Self {
-            messages: Vec::new(),
+        let mut app = Self {
+            messages: HashMap::new(),
             peers: HashMap::new(),
-            peer_ids: Vec::new(),
+            peer_ids: vec!["__group__".to_string()],
             custom_names: HashMap::new(),
             selected: 0,
             identity_phrase: None,
@@ -275,10 +289,19 @@ impl App {
             current_ttl: None,
             selected_interface: None,
             default_interface: None,
-        }
+            storage_key: None,
+            config_dir: None,
+            active_file_transfers: HashMap::new(),
+        };
+        app.peers.insert("__group__".to_string(), ("Lobby (Group Chat)".to_string(), "".to_string()));
+        app
     }
 
     pub fn get_display_name(&self, id: &str) -> String {
+        if id == "__group__" {
+            return "Lobby (Group Chat)".to_string();
+        }
+
         if let Some(name) = self.custom_names.get(id) {
             return name.clone();
         }
@@ -296,11 +319,47 @@ impl App {
 
     pub fn cleanup_expired_messages(&mut self) {
         let now = Instant::now();
+        for msgs in self.messages.values_mut() {
+            msgs.retain(|msg| {
+                msg.ttl
+                    .is_none_or(|ttl| now.duration_since(msg.received_at) < Duration::from_secs(ttl))
+            });
+        }
+    }
 
-        self.messages.retain(|msg| {
-            msg.ttl
-                .is_none_or(|ttl| now.duration_since(msg.received_at) < Duration::from_secs(ttl))
-        });
+    pub fn save_history(&self) {
+        if let (Some(config_dir), Some(storage_key)) = (&self.config_dir, &self.storage_key) {
+            let mut stored = Vec::new();
+            for (peer_id, msgs) in &self.messages {
+                for msg in msgs {
+                    stored.push(crate::storage::StoredMessage {
+                        peer_id: peer_id.clone(),
+                        from: msg.from.clone(),
+                        content: msg.content.clone(),
+                        is_system: msg.is_system,
+                        ttl: msg.ttl,
+                        timestamp_secs: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    });
+                }
+            }
+            let _ = crate::storage::save_history(config_dir, storage_key, &stored);
+        }
+    }
+
+    pub fn save_peers(&self) {
+        if let (Some(config_dir), Some(storage_key)) = (&self.config_dir, &self.storage_key) {
+            if let Ok(mut peers) = crate::storage::load_peers(config_dir, storage_key) {
+                for (id, peer_info) in peers.iter_mut() {
+                    if let Some(custom_name) = self.custom_names.get(id) {
+                        peer_info.custom_name = Some(custom_name.clone());
+                    }
+                }
+                let _ = crate::storage::save_peers(config_dir, storage_key, &peers);
+            }
+        }
     }
 }
 
@@ -328,7 +387,8 @@ pub async fn run_app(
                                         .insert(peer_id, app.rename_input.drain(..).collect());
 
                                     let current_peer_id = app.peer_ids[app.selected].clone();
-                                    app.peer_ids.sort_by(|a, b| {
+                                    let mut peers_to_sort: Vec<String> = app.peer_ids.iter().filter(|&x| x != "__group__").cloned().collect();
+                                    peers_to_sort.sort_by(|a, b| {
                                         let name_a = app
                                             .custom_names
                                             .get(a)
@@ -346,11 +406,14 @@ pub async fn run_app(
 
                                         name_a.cmp(name_b)
                                     });
+                                    app.peer_ids = vec!["__group__".to_string()];
+                                    app.peer_ids.extend(peers_to_sort);
                                     app.selected = app
                                         .peer_ids
                                         .iter()
                                         .position(|id| id == &current_peer_id)
                                         .unwrap_or(0);
+                                    app.save_peers();
                                 }
                                 app.is_renaming = false;
                             }
@@ -379,18 +442,28 @@ pub async fn run_app(
                                             Some(s) => format!("TTL is set to {} — messages disappear after that time. Use /ttl <time> to change or /ttl 0 to disable.", format_ttl(s)),
                                             None => "TTL is disabled — messages persist until you close the app. Use /ttl <time> to enable (e.g. /ttl 30m, /ttl 2h, /ttl 1d).".to_string(),
                                         };
-                                        app.messages.push(Message {
+                                        let active_channel = if !app.peer_ids.is_empty() {
+                                            app.peer_ids[app.selected].clone()
+                                        } else {
+                                            "__group__".to_string()
+                                        };
+                                        app.messages.entry(active_channel).or_default().push(Message {
                                             from: "System".to_string(),
                                             content: status,
                                             is_system: true,
                                             ttl: None,
                                             received_at: Instant::now(),
                                         });
+                                        app.save_history();
                                     } else if input.starts_with("/ttl ") {
                                         let parts: Vec<&str> = input.split_whitespace().collect();
-                                        // fix: wrong arg count now surfaces an error instead of silently doing nothing
+                                        let active_channel = if !app.peer_ids.is_empty() {
+                                            app.peer_ids[app.selected].clone()
+                                        } else {
+                                            "__group__".to_string()
+                                        };
                                         if parts.len() != 2 {
-                                            app.messages.push(Message {
+                                            app.messages.entry(active_channel.clone()).or_default().push(Message {
                                                 from: "System".to_string(),
                                                 content: "Usage: /ttl <time>  (e.g. 30s, 5m, 2h, 1d) or /ttl 0 to disable".to_string(),
                                                 is_system: true,
@@ -403,10 +476,10 @@ pub async fn run_app(
                                                     app.current_ttl = None;
 
                                                     let _ = msg_tx.try_send(
-                                                        OutboundMessage::TTLNotice { ttl: None },
+                                                        OutboundMessage::TTLNotice { target: active_channel.clone(), ttl: None },
                                                     );
 
-                                                    app.messages.push(Message {
+                                                    app.messages.entry(active_channel.clone()).or_default().push(Message {
                                                         from: "System".to_string(),
                                                         content: "TTL disabled — new messages will persist.".to_string(),
                                                         is_system: true,
@@ -419,11 +492,12 @@ pub async fn run_app(
 
                                                     let _ = msg_tx.try_send(
                                                         OutboundMessage::TTLNotice {
+                                                            target: active_channel.clone(),
                                                             ttl: Some(ttl),
                                                         },
                                                     );
 
-                                                    app.messages.push(Message {
+                                                    app.messages.entry(active_channel.clone()).or_default().push(Message {
                                                         from: "System".to_string(),
                                                         content: format!("TTL set to {} — new messages will disappear after that time.", format_ttl(ttl)),
                                                         is_system: true,
@@ -431,9 +505,8 @@ pub async fn run_app(
                                                         received_at: Instant::now(),
                                                     });
                                                 }
-                                                // fix: values above MAX_TTL now surface an error instead of silently doing nothing
                                                 Ok(_) => {
-                                                    app.messages.push(Message {
+                                                    app.messages.entry(active_channel.clone()).or_default().push(Message {
                                                         from: "System".to_string(),
                                                         content: format!(
                                                             "TTL too large — maximum is {} ({}s).",
@@ -445,9 +518,8 @@ pub async fn run_app(
                                                         received_at: Instant::now(),
                                                     });
                                                 }
-                                                // fix: unparseable input now surfaces an error instead of silently doing nothing
                                                 Err(()) => {
-                                                    app.messages.push(Message {
+                                                    app.messages.entry(active_channel.clone()).or_default().push(Message {
                                                         from: "System".to_string(),
                                                         content: format!("Invalid TTL '{}' — expected a number with an optional unit: 30s, 5m, 2h, 1d.", parts[1]),
                                                         is_system: true,
@@ -457,34 +529,61 @@ pub async fn run_app(
                                                 }
                                             }
                                         }
-                                    } else if msg_tx
-                                        .try_send(OutboundMessage::Message {
-                                            text: input.clone(),
-                                            ttl: app.current_ttl,
-                                        })
-                                        .is_ok()
-                                    {
-                                        app.messages.push(Message {
-                                            from: "Me".to_string(),
-                                            content: input,
-                                            is_system: false,
-                                            ttl: app.current_ttl,
-                                            received_at: Instant::now(),
-                                        });
+                                        app.save_history();
+                                    } else if input.starts_with("/connect ") {
+                                        let addr = input.strip_prefix("/connect ").unwrap().trim().to_string();
+                                        if !addr.is_empty() {
+                                            let _ = connect_tx.try_send(addr);
+                                        }
+                                    } else {
+                                        let target = if !app.peer_ids.is_empty() {
+                                            app.peer_ids[app.selected].clone()
+                                        } else {
+                                            "__group__".to_string()
+                                        };
+                                        if msg_tx
+                                            .try_send(OutboundMessage::Message {
+                                                target: target.clone(),
+                                                text: input.clone(),
+                                                ttl: app.current_ttl,
+                                            })
+                                            .is_ok()
+                                        {
+                                            app.messages.entry(target).or_default().push(Message {
+                                                from: "Me".to_string(),
+                                                content: input,
+                                                is_system: false,
+                                                ttl: app.current_ttl,
+                                                received_at: Instant::now(),
+                                            });
+                                            app.save_history();
+                                        }
                                     }
                                 } else if !app.peer_ids.is_empty() {
                                     let peer_id = &app.peer_ids[app.selected];
-                                    if let Some((name, addr)) = app.peers.get(peer_id) {
-                                        let display_name =
-                                            app.custom_names.get(peer_id).unwrap_or(name);
-                                        app.messages.push(Message {
-                                            from: "System".to_string(),
-                                            content: format!("Connecting to {}...", display_name),
-                                            is_system: true,
-                                            ttl: None,
-                                            received_at: Instant::now(),
-                                        });
-                                        let _ = connect_tx.try_send(addr.clone());
+                                    if peer_id != "__group__" {
+                                        if let Some((name, addr)) = app.peers.get(peer_id) {
+                                            if addr == "Offline" {
+                                                app.messages.entry(peer_id.clone()).or_default().push(Message {
+                                                    from: "System".to_string(),
+                                                    content: "Peer is offline. Waiting for discovery broadcast, or connect directly using: /connect <ip>:<port>".to_string(),
+                                                    is_system: true,
+                                                    ttl: None,
+                                                    received_at: Instant::now(),
+                                                });
+                                            } else {
+                                                let display_name =
+                                                    app.custom_names.get(peer_id).unwrap_or(name);
+                                                app.messages.entry(peer_id.clone()).or_default().push(Message {
+                                                    from: "System".to_string(),
+                                                    content: format!("Connecting to {}...", display_name),
+                                                    is_system: true,
+                                                    ttl: None,
+                                                    received_at: Instant::now(),
+                                                });
+                                                let _ = connect_tx.try_send(addr.clone());
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -537,12 +636,14 @@ pub async fn run_app(
                             }
                             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 if !app.peer_ids.is_empty() {
-                                    app.is_renaming = true;
                                     let peer_id = &app.peer_ids[app.selected];
-                                    app.rename_input =
-                                        app.custom_names.get(peer_id).cloned().unwrap_or_else(
-                                            || app.peers.get(peer_id).unwrap().0.clone(),
-                                        );
+                                    if peer_id != "__group__" {
+                                        app.is_renaming = true;
+                                        app.rename_input =
+                                            app.custom_names.get(peer_id).cloned().unwrap_or_else(
+                                                || app.peers.get(peer_id).unwrap().0.clone(),
+                                            );
+                                    }
                                 }
                             }
                             KeyCode::Char(c) => {
@@ -570,7 +671,20 @@ pub async fn run_app(
                     mut text,
                     is_system,
                     ttl,
+                    group,
                 } => {
+                    let target_channel = if let Some(_) = &group {
+                        "__group__".to_string()
+                    } else if is_system {
+                        if !app.peer_ids.is_empty() {
+                            app.peer_ids[app.selected].clone()
+                        } else {
+                            "__group__".to_string()
+                        }
+                    } else {
+                        from.clone()
+                    };
+
                     if is_system {
                         if text.starts_with("Connected to ") {
                             let id = text.strip_prefix("Connected to ").unwrap();
@@ -592,41 +706,68 @@ pub async fn run_app(
                             }
                         }
                     }
-                    app.messages.push(Message {
+
+                    app.messages.entry(target_channel).or_default().push(Message {
                         from,
                         content: text,
                         is_system,
                         ttl,
                         received_at: Instant::now(),
                     });
+                    app.save_history();
                 }
                 UiEvent::HandshakeComplete(code) => {
                     app.identity_phrase = Some(code);
                 }
                 UiEvent::PeerUpdate { id, name, addr } => {
-                    if !app.peers.contains_key(&id) {
-                        app.peer_ids.push(id.clone());
-                        app.peer_ids.sort_by(|a, b| {
-                            let name_a = app
-                                .custom_names
-                                .get(a)
-                                .map(|s| s.as_str())
-                                .unwrap_or_else(|| {
-                                    app.peers.get(a).map(|p| p.0.as_str()).unwrap_or(a)
-                                });
-                            let name_b = app
-                                .custom_names
-                                .get(b)
-                                .map(|s| s.as_str())
-                                .unwrap_or_else(|| {
-                                    app.peers.get(b).map(|p| p.0.as_str()).unwrap_or(b)
-                                });
+                    if id != "__group__" {
+                        if !app.peers.contains_key(&id) {
+                            app.peer_ids.push(id.clone());
+                            let mut peers_to_sort: Vec<String> = app.peer_ids.iter().filter(|&x| x != "__group__").cloned().collect();
+                            peers_to_sort.sort_by(|a, b| {
+                                let name_a = app
+                                    .custom_names
+                                    .get(a)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or_else(|| {
+                                        app.peers.get(a).map(|p| p.0.as_str()).unwrap_or(a)
+                                    });
+                                let name_b = app
+                                    .custom_names
+                                    .get(b)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or_else(|| {
+                                        app.peers.get(b).map(|p| p.0.as_str()).unwrap_or(b)
+                                    });
 
-                            name_a.cmp(name_b)
-                        });
+                                name_a.cmp(name_b)
+                            });
+                            app.peer_ids = vec!["__group__".to_string()];
+                            app.peer_ids.extend(peers_to_sort);
+                        }
+
+                        app.peers.insert(id, (name, addr));
                     }
-
-                    app.peers.insert(id, (name, addr));
+                }
+                UiEvent::FileProgress {
+                    peer_id: _,
+                    file_name,
+                    total_size,
+                    bytes_transferred,
+                    is_sending,
+                } => {
+                    app.active_file_transfers.entry(file_name.clone())
+                        .and_modify(|t| t.bytes_transferred = bytes_transferred)
+                        .or_insert(FileTransfer {
+                            file_name: file_name.clone(),
+                            total_size,
+                            bytes_transferred,
+                            is_sending,
+                            start_time: Instant::now(),
+                        });
+                    if bytes_transferred >= total_size {
+                        app.active_file_transfers.remove(&file_name);
+                    }
                 }
             }
         }
@@ -639,11 +780,16 @@ fn render(f: &mut Frame, app: &App) {
         .as_ref()
         .map_or(false, |a| !a.matches.is_empty());
     let input_height = if show_autocomplete { 4 } else { 3 };
+    
+    let active_transfer = app.active_file_transfers.values().next();
+    let file_bar_height = if active_transfer.is_some() { 3 } else { 0 };
+
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(0),
+            Constraint::Length(file_bar_height),
             Constraint::Length(input_height),
         ])
         .split(f.area());
@@ -700,18 +846,44 @@ fn render(f: &mut Frame, app: &App) {
         .enumerate()
         .map(|(i, id)| {
             let display_name = app.get_display_name(id);
-            let style = if i == app.selected {
-                Style::default().fg(Color::Black).bg(Color::Yellow)
+            let (style, status) = if id == "__group__" {
+                (
+                    if i == app.selected {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::Cyan)
+                    },
+                    "".to_string()
+                )
             } else {
-                Style::default().fg(Color::Yellow)
+                let status = if let Some((_, addr)) = app.peers.get(id) {
+                    if addr == "Offline" { " [Offline]" } else { " [Connected]" }
+                } else {
+                    " [Offline]"
+                };
+                (
+                    if i == app.selected {
+                        Style::default().fg(Color::Black).bg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    },
+                    status.to_string()
+                )
             };
 
-            ListItem::new(Line::from(vec![
-                Span::styled(display_name, style),
-                Span::raw(" ("),
-                Span::styled(id, Style::default().fg(Color::DarkGray)),
-                Span::raw(")"),
-            ]))
+            if id == "__group__" {
+                ListItem::new(Line::from(vec![
+                    Span::styled(display_name, style),
+                ]))
+            } else {
+                ListItem::new(Line::from(vec![
+                    Span::styled(display_name, style),
+                    Span::styled(status, Style::default().fg(Color::DarkGray)),
+                    Span::raw(" ("),
+                    Span::styled(id, Style::default().fg(Color::DarkGray)),
+                    Span::raw(")"),
+                ]))
+            }
         })
         .collect();
 
@@ -722,9 +894,18 @@ fn render(f: &mut Frame, app: &App) {
     );
     f.render_widget(peers_list, middle_layout[0]);
 
+    let active_channel = if !app.peer_ids.is_empty() {
+        app.peer_ids[app.selected].clone()
+    } else {
+        "__group__".to_string()
+    };
+    
     let messages: Vec<ListItem> = app
         .messages
-        .iter()
+        .get(&active_channel)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
         .rev()
         .map(|msg| {
             let style = if msg.is_system {
@@ -748,7 +929,7 @@ fn render(f: &mut Frame, app: &App) {
                     format!("{}: ", display_from),
                     style.add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(&msg.content),
+                Span::raw(msg.content),
             ];
 
             ListItem::new(Line::from(spans))
@@ -758,6 +939,39 @@ fn render(f: &mut Frame, app: &App) {
     let chat = List::new(messages).block(Block::default().borders(Borders::ALL).title("Chat"));
     f.render_widget(chat, middle_layout[1]);
 
+    if let Some(transfer) = active_transfer {
+        let percent = if transfer.total_size > 0 {
+            (transfer.bytes_transferred as f64 / transfer.total_size as f64 * 100.0) as u16
+        } else {
+            0
+        };
+
+        let direction = if transfer.is_sending { "Sending" } else { "Receiving" };
+        let elapsed = transfer.start_time.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.1 {
+            transfer.bytes_transferred as f64 / elapsed / 1024.0 / 1024.0
+        } else {
+            0.0
+        };
+
+        let label = format!(
+            "{} {}: {}/{} bytes ({:.2} MB/s) - {}%",
+            direction,
+            transfer.file_name,
+            transfer.bytes_transferred,
+            transfer.total_size,
+            speed,
+            percent
+        );
+
+        let gauge = ratatui::widgets::Gauge::default()
+            .block(Block::default().borders(Borders::ALL).title("File Transfer Progress"))
+            .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+            .percent(percent)
+            .label(label);
+        f.render_widget(gauge, main_layout[2]);
+    }
+
     if show_autocomplete {
         let input_layout = Layout::default()
             .direction(Direction::Vertical)
@@ -765,7 +979,7 @@ fn render(f: &mut Frame, app: &App) {
                 Constraint::Length(1), // Suggestions bar
                 Constraint::Length(3), // Input field
             ])
-            .split(main_layout[2]);
+            .split(main_layout[3]);
 
         if let Some(state) = &app.autocomplete {
             let mut spans = vec![Span::styled(
@@ -814,16 +1028,16 @@ fn render(f: &mut Frame, app: &App) {
         let input = Paragraph::new(app.input.as_str()).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Message (Esc: quit | Ctrl+B: broadcast | Ctrl+R: rename | /send <file> | /accept [<path>] | /decline | /save_dir <path> | /ttl [30s|5m|2h|0]))"),
+                .title("Message (Esc: quit | Ctrl+B: broadcast | Ctrl+R: rename | /connect <ip>:<port> | /send <file> | /accept [<path>] | /decline | /save_dir <path> | /ttl [30s|5m|2h|0]))"),
         );
         f.render_widget(input, input_layout[1]);
     } else {
         let input = Paragraph::new(app.input.as_str()).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Message (Esc: quit | Ctrl+B: broadcast | Ctrl+R: rename | /send <file> | /accept [<path>] | /decline | /save_dir <path> | /ttl [30s|5m|2h|0]))"),
+                .title("Message (Esc: quit | Ctrl+B: broadcast | Ctrl+R: rename | /connect <ip>:<port> | /send <file> | /accept [<path>] | /decline | /save_dir <path> | /ttl [30s|5m|2h|0]))"),
         );
-        f.render_widget(input, main_layout[2]);
+        f.render_widget(input, main_layout[3]);
     }
 
     if app.is_renaming {

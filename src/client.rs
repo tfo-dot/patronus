@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::io::Cursor;
 use std::io::Read;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt};
 use tokio::sync::mpsc;
 use tokio_util::bytes::BufMut;
 use x25519_dalek::PublicKey;
@@ -27,8 +27,8 @@ pub const KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 #[derive(Debug, Clone)]
 pub enum OutboundMessage {
-    Message { text: String, ttl: Option<u64> },
-    TTLNotice { ttl: Option<u64> },
+    Message { target: String, text: String, ttl: Option<u64> },
+    TTLNotice { target: String, ttl: Option<u64> },
 }
 
 #[derive(Debug, Clone)]
@@ -38,12 +38,20 @@ pub enum UiEvent {
         text: String,
         is_system: bool,
         ttl: Option<u64>,
+        group: Option<String>,
     },
     HandshakeComplete(String),
     PeerUpdate {
         id: String,
         name: String,
         addr: String,
+    },
+    FileProgress {
+        peer_id: String,
+        file_name: String,
+        total_size: u64,
+        bytes_transferred: u64,
+        is_sending: bool,
     },
 }
 
@@ -53,6 +61,7 @@ pub fn sys_msg(text: impl Into<String>) -> UiEvent {
         text: text.into(),
         is_system: true,
         ttl: None,
+        group: None,
     }
 }
 
@@ -119,7 +128,12 @@ impl PatronusClient {
         }
     }
 
-    pub async fn handshake<S>(&mut self, stream: &mut S, is_initiator: bool) -> Result<()>
+    pub async fn handshake<S>(
+        &mut self,
+        stream: &mut S,
+        is_initiator: bool,
+        trusted_peers: &std::collections::HashMap<String, crate::storage::PeerInfo>,
+    ) -> Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
@@ -217,9 +231,18 @@ impl PatronusClient {
             .complete_handshake(&peer_ephemeral_pk, &peer_static_pk, is_initiator)
             .map_err(|e| anyhow!(e))?;
 
+        let peer_node_id_bytes = sha2::Sha256::digest(peer_static_pk.as_bytes());
+        let peer_node_id_str = BASE64.encode(&peer_node_id_bytes);
+
+        if let Some(existing) = trusted_peers.get(&peer_node_id_str) {
+            let existing_pk_bytes = BASE64.decode(existing.static_public_key_b64.as_bytes())?;
+            if existing_pk_bytes != peer_static_pk.as_bytes() {
+                return Err(anyhow!("Security Violation (0x03): TOFU public key mismatch for peer {}", peer_node_id_str));
+            }
+        }
+
         self.identity_phrase = Some(phrase);
-        let peer_node_id = sha2::Sha256::digest(peer_static_pk.as_bytes());
-        self.peer_node_id = Some(BASE64.encode(&peer_node_id));
+        self.peer_node_id = Some(peer_node_id_str);
 
         Ok(())
     }
@@ -255,12 +278,14 @@ impl PatronusClient {
                 if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&payload) {
                     let text = json["text"].as_str().ok_or_else(|| anyhow!("Invalid text field"))?;
                     let ttl = json["ttl"].as_u64();
+                    let group = json["group"].as_str().map(|s| s.to_string());
 
                     let _ = ui_tx.send(UiEvent::Message {
                         from: peer_id,
                         text: text.to_string(),
                         is_system: false,
                         ttl,
+                        group,
                     }).await;
                 }
             }
@@ -285,10 +310,19 @@ impl PatronusClient {
                 } else if let Some(accept_val) = json.get("file_accept") {
                     if let Some(_merkle_root) = accept_val.get("merkle_root").and_then(|v| v.as_str()) {
                         if let Some((path, file_key, file_name)) = self.pending_send_file.take() {
-                            let _ = ui_tx.send(sys_msg(format!("Peer accepted. Transmitting file: {file_name}..."))).await;
+                            let start_offset = accept_val.get("start_offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let _ = ui_tx.send(sys_msg(format!("Peer accepted. Transmitting file: {file_name} starting at offset {start_offset}..."))).await;
 
                             match tokio::fs::File::open(&path).await {
                                 Ok(mut file) => {
+                                    let total_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                                    if start_offset > 0 {
+                                        if let Err(e) = file.seek(std::io::SeekFrom::Start(start_offset)).await {
+                                            let _ = ui_tx.send(sys_msg(format!("Failed to seek to offset {start_offset}: {e}"))).await;
+                                            return Ok(());
+                                        }
+                                    }
+
                                     let mut chunk_buffer = vec![0u8; 16384]; // 16KB chunks
                                     let mut sent_bytes = 0;
                                     let mut error_occurred = false;
@@ -303,10 +337,17 @@ impl PatronusClient {
                                         }
 
                                         sent_bytes += n as u64;
+                                        let _ = ui_tx.send(UiEvent::FileProgress {
+                                            peer_id: peer_id.clone(),
+                                            file_name: file_name.clone(),
+                                            total_size,
+                                            bytes_transferred: start_offset + sent_bytes,
+                                            is_sending: true,
+                                        }).await;
                                     }
 
                                     if !error_occurred {
-                                        let _ = ui_tx.send(sys_msg(format!("Finished sending {file_name} ({sent_bytes} bytes)"))).await;
+                                        let _ = ui_tx.send(sys_msg(format!("Finished sending {file_name} ({} bytes)", start_offset + sent_bytes))).await;
                                     }
                                 }
                                 Err(e) => {
@@ -357,8 +398,17 @@ impl PatronusClient {
                         Ok((0x03, chunk)) => {
                             file.write_all(&chunk).await?;
                             self.receiving_bytes_seen += chunk.len() as u64;
+                            let current_seen = self.receiving_bytes_seen;
 
-                            if self.receiving_bytes_seen >= size {
+                            let _ = ui_tx.send(UiEvent::FileProgress {
+                                peer_id: peer_id.clone(),
+                                file_name: name.clone(),
+                                total_size: size,
+                                bytes_transferred: current_seen,
+                                is_sending: false,
+                            }).await;
+
+                            if current_seen >= size {
                                 let _ = ui_tx.send(sys_msg(format!("File transfer complete: {name}"))).await;
                                 self.receiving_file = None;
                                 self.receiving_key = None;
@@ -395,11 +445,14 @@ impl PatronusClient {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         match msg {
-            OutboundMessage::Message { text, ttl } => {
-                self.handle_outbound_command(stream, text, ttl, ui_tx).await
+            OutboundMessage::Message { target, text, ttl } => {
+                // We keep track of the target context (e.g. if it is a group message)
+                // in send_app_message. We pass the full OutboundMessage to handle_outbound_command
+                // so it can propagate the target properly.
+                self.handle_outbound_command(stream, target, text, ttl, ui_tx).await
             }
-            OutboundMessage::TTLNotice { ttl } => {
-                if let Err(e) = self.send_app_message(stream, OutboundMessage::TTLNotice { ttl }).await {
+            OutboundMessage::TTLNotice { target, ttl } => {
+                if let Err(e) = self.send_app_message(stream, OutboundMessage::TTLNotice { target, ttl }).await {
                     self.send_bye = false;
                     return Err(e);
                 }
@@ -411,6 +464,7 @@ impl PatronusClient {
     pub async fn handle_outbound_command<S>(
         &mut self,
         stream: &mut S,
+        target: String,
         text: String,
         ttl: Option<u64>,
         ui_tx: &mpsc::Sender<UiEvent>,
@@ -527,8 +581,36 @@ impl PatronusClient {
                 }
             }
 
-            match tokio::fs::File::create(&target_path).await {
-                Ok(file) => {
+            let mut start_offset = 0u64;
+            if target_path.exists() {
+                if let Ok(metadata) = std::fs::metadata(&target_path) {
+                    let local_len = metadata.len();
+                    if local_len < offer.size {
+                        start_offset = local_len;
+                        let _ = ui_tx.send(sys_msg(format!("Found partial download of {} bytes. Attempting to resume...", start_offset))).await;
+                    } else if local_len == offer.size {
+                        let _ = ui_tx.send(sys_msg("File already completely downloaded.")).await;
+                        return Ok(());
+                    }
+                }
+            }
+
+            let mut file_opts = tokio::fs::OpenOptions::new();
+            file_opts.write(true).create(true);
+            if start_offset == 0 {
+                file_opts.truncate(true);
+            }
+
+            match file_opts.open(&target_path).await {
+                Ok(mut file) => {
+                    if start_offset > 0 {
+                        if let Err(e) = file.seek(std::io::SeekFrom::Start(start_offset)).await {
+                            let _ = ui_tx.send(sys_msg(format!("Failed to seek destination file: {e}"))).await;
+                            self.pending_recv_offer = Some(offer);
+                            return Ok(());
+                        }
+                    }
+
                     let key = match self.crypto.derive_file_key(offer.merkle_root.as_bytes()) {
                         Ok(k) => k,
                         Err(e) => {
@@ -546,9 +628,9 @@ impl PatronusClient {
 
                     self.receiving_file = Some((file, offer.file_name.clone(), offer.size));
                     self.receiving_key = Some(key);
-                    self.receiving_bytes_seen = 0;
+                    self.receiving_bytes_seen = start_offset;
 
-                    if let Err(e) = self.send_file_accept(stream, &offer.merkle_root).await {
+                    if let Err(e) = self.send_file_accept(stream, &offer.merkle_root, Some(start_offset)).await {
                         let _ = ui_tx.send(sys_msg(format!("Failed to send acceptance: {e}"))).await;
                     }
                 }
@@ -577,7 +659,7 @@ impl PatronusClient {
         }
 
         // Default: Send as normal application message
-        if let Err(e) = self.send_app_message(stream, OutboundMessage::Message { text, ttl }).await {
+        if let Err(e) = self.send_app_message(stream, OutboundMessage::Message { target, text, ttl }).await {
             self.send_bye = false;
             return Err(e);
         }
@@ -600,8 +682,14 @@ impl PatronusClient {
         S: tokio::io::AsyncWrite + Unpin,
     {
         let (msg_type, json) = match msg {
-            OutboundMessage::Message { text, ttl } => {
+            OutboundMessage::Message { target, text, ttl } => {
                 let mut base = serde_json::json!({"text": text});
+
+                if target == "__group__" {
+                    if let Some(obj) = base.as_object_mut() {
+                        obj.insert("group".to_string(), "Lobby".into());
+                    }
+                }
 
                 if let Some(val) = ttl {
                     if let Some(obj) = base.as_object_mut() {
@@ -611,7 +699,7 @@ impl PatronusClient {
 
                 (0x01, base)
             }
-            OutboundMessage::TTLNotice { ttl } => (0x03, serde_json::json!({ "ttl_notice": ttl })),
+            OutboundMessage::TTLNotice { ttl, .. } => (0x03, serde_json::json!({ "ttl_notice": ttl })),
         };
 
         let payload = serde_json::to_vec(&json)?;
@@ -640,13 +728,19 @@ impl PatronusClient {
         Ok(())
     }
 
-    pub async fn send_file_accept<S>(&mut self, stream: &mut S, merkle_root: &str) -> Result<()>
+    pub async fn send_file_accept<S>(
+        &mut self,
+        stream: &mut S,
+        merkle_root: &str,
+        start_offset: Option<u64>,
+    ) -> Result<()>
     where
         S: tokio::io::AsyncWrite + Unpin,
     {
         let json = serde_json::json!({
             "file_accept": {
-                "merkle_root": merkle_root
+                "merkle_root": merkle_root,
+                "start_offset": start_offset
             }
         });
         let payload = serde_json::to_vec(&json)?;
