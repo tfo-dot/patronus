@@ -275,10 +275,10 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        let mut app = Self {
+        Self {
             messages: HashMap::new(),
             peers: HashMap::new(),
-            peer_ids: vec!["__group__".to_string()],
+            peer_ids: Vec::new(),
             custom_names: HashMap::new(),
             selected: 0,
             identity_phrase: None,
@@ -293,14 +293,12 @@ impl App {
             storage_key: None,
             config_dir: None,
             active_file_transfers: HashMap::new(),
-        };
-        app.peers.insert("__group__".to_string(), ("Lobby (Group Chat)".to_string(), "".to_string()));
-        app
+        }
     }
 
     pub fn get_display_name(&self, id: &str) -> String {
-        if id == "__group__" {
-            return "Lobby (Group Chat)".to_string();
+        if id == "System" {
+            return "System".to_string();
         }
 
         if let Some(name) = self.custom_names.get(id) {
@@ -388,7 +386,7 @@ pub async fn run_app(
                                         .insert(peer_id, app.rename_input.drain(..).collect());
 
                                     let current_peer_id = app.peer_ids[app.selected].clone();
-                                    let mut peers_to_sort: Vec<String> = app.peer_ids.iter().filter(|&x| x != "__group__").cloned().collect();
+                                    let mut peers_to_sort: Vec<String> = app.peer_ids.clone();
                                     peers_to_sort.sort_by(|a, b| {
                                         let name_a = app
                                             .custom_names
@@ -407,8 +405,7 @@ pub async fn run_app(
 
                                         name_a.cmp(name_b)
                                     });
-                                    app.peer_ids = vec!["__group__".to_string()];
-                                    app.peer_ids.extend(peers_to_sort);
+                                    app.peer_ids = peers_to_sort;
                                     app.selected = app
                                         .peer_ids
                                         .iter()
@@ -446,7 +443,7 @@ pub async fn run_app(
                                         let active_channel = if !app.peer_ids.is_empty() {
                                             app.peer_ids[app.selected].clone()
                                         } else {
-                                            "__group__".to_string()
+                                            "System".to_string()
                                         };
                                         app.messages.entry(active_channel).or_default().push(Message {
                                             from: "System".to_string(),
@@ -461,7 +458,7 @@ pub async fn run_app(
                                         let active_channel = if !app.peer_ids.is_empty() {
                                             app.peer_ids[app.selected].clone()
                                         } else {
-                                            "__group__".to_string()
+                                            "System".to_string()
                                         };
                                         if parts.len() != 2 {
                                             app.messages.entry(active_channel.clone()).or_default().push(Message {
@@ -538,52 +535,60 @@ pub async fn run_app(
                                         }
                                     } else {
                                         let target = if !app.peer_ids.is_empty() {
-                                            app.peer_ids[app.selected].clone()
+                                            Some(app.peer_ids[app.selected].clone())
                                         } else {
-                                            "__group__".to_string()
+                                            None
                                         };
-                                        if msg_tx
-                                            .try_send(OutboundMessage::Message {
-                                                target: target.clone(),
-                                                text: input.clone(),
-                                                ttl: app.current_ttl,
-                                            })
-                                            .is_ok()
-                                        {
-                                            app.messages.entry(target).or_default().push(Message {
-                                                from: "Me".to_string(),
-                                                content: input,
-                                                is_system: false,
-                                                ttl: app.current_ttl,
+                                        if let Some(target) = target {
+                                            if msg_tx
+                                                .try_send(OutboundMessage::Message {
+                                                    target: target.clone(),
+                                                    text: input.clone(),
+                                                    ttl: app.current_ttl,
+                                                })
+                                                .is_ok()
+                                            {
+                                                app.messages.entry(target).or_default().push(Message {
+                                                    from: "Me".to_string(),
+                                                    content: input,
+                                                    is_system: false,
+                                                    ttl: app.current_ttl,
+                                                    received_at: Instant::now(),
+                                                });
+                                                app.save_history();
+                                            }
+                                        } else {
+                                            app.messages.entry("System".to_string()).or_default().push(Message {
+                                                from: "System".to_string(),
+                                                content: "No peer selected. Connect to a peer first.".to_string(),
+                                                is_system: true,
+                                                ttl: None,
                                                 received_at: Instant::now(),
                                             });
-                                            app.save_history();
                                         }
                                     }
                                 } else if !app.peer_ids.is_empty() {
                                     let peer_id = &app.peer_ids[app.selected];
-                                    if peer_id != "__group__" {
-                                        if let Some((name, addr)) = app.peers.get(peer_id) {
-                                            if addr == "Offline" {
-                                                app.messages.entry(peer_id.clone()).or_default().push(Message {
-                                                    from: "System".to_string(),
-                                                    content: "Peer is offline. Waiting for discovery broadcast, or connect directly using: /connect <ip>:<port>".to_string(),
-                                                    is_system: true,
-                                                    ttl: None,
-                                                    received_at: Instant::now(),
-                                                });
-                                            } else {
-                                                let display_name =
-                                                    app.custom_names.get(peer_id).unwrap_or(name);
-                                                app.messages.entry(peer_id.clone()).or_default().push(Message {
-                                                    from: "System".to_string(),
-                                                    content: format!("Connecting to {}...", display_name),
-                                                    is_system: true,
-                                                    ttl: None,
-                                                    received_at: Instant::now(),
-                                                });
-                                                let _ = connect_tx.try_send(addr.clone());
-                                            }
+                                    if let Some((name, addr)) = app.peers.get(peer_id) {
+                                        if addr == "Offline" {
+                                            app.messages.entry(peer_id.clone()).or_default().push(Message {
+                                                from: "System".to_string(),
+                                                content: "Peer is offline. Waiting for discovery broadcast, or connect directly using: /connect <ip>:<port>".to_string(),
+                                                is_system: true,
+                                                ttl: None,
+                                                received_at: Instant::now(),
+                                            });
+                                        } else {
+                                            let display_name =
+                                                app.custom_names.get(peer_id).unwrap_or(name);
+                                            app.messages.entry(peer_id.clone()).or_default().push(Message {
+                                                from: "System".to_string(),
+                                                content: format!("Connecting to {}...", display_name),
+                                                is_system: true,
+                                                ttl: None,
+                                                received_at: Instant::now(),
+                                            });
+                                            let _ = connect_tx.try_send(addr.clone());
                                         }
                                     }
                                 }
@@ -638,13 +643,11 @@ pub async fn run_app(
                             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 if !app.peer_ids.is_empty() {
                                     let peer_id = &app.peer_ids[app.selected];
-                                    if peer_id != "__group__" {
-                                        app.is_renaming = true;
-                                        app.rename_input =
-                                            app.custom_names.get(peer_id).cloned().unwrap_or_else(
-                                                || app.peers.get(peer_id).unwrap().0.clone(),
-                                            );
-                                    }
+                                    app.is_renaming = true;
+                                    app.rename_input =
+                                        app.custom_names.get(peer_id).cloned().unwrap_or_else(
+                                            || app.peers.get(peer_id).unwrap().0.clone(),
+                                        );
                                 }
                             }
                             KeyCode::Char(c) => {
@@ -675,12 +678,12 @@ pub async fn run_app(
                     group,
                 } => {
                     let target_channel = if let Some(_) = &group {
-                        "__group__".to_string()
+                        from.clone()
                     } else if is_system {
                         if !app.peer_ids.is_empty() {
                             app.peer_ids[app.selected].clone()
                         } else {
-                            "__group__".to_string()
+                            "System".to_string()
                         }
                     } else {
                         from.clone()
@@ -721,34 +724,31 @@ pub async fn run_app(
                     app.identity_phrase = Some(code);
                 }
                 UiEvent::PeerUpdate { id, name, addr } => {
-                    if id != "__group__" {
-                        if !app.peers.contains_key(&id) {
-                            app.peer_ids.push(id.clone());
-                            let mut peers_to_sort: Vec<String> = app.peer_ids.iter().filter(|&x| x != "__group__").cloned().collect();
-                            peers_to_sort.sort_by(|a, b| {
-                                let name_a = app
-                                    .custom_names
-                                    .get(a)
-                                    .map(|s| s.as_str())
-                                    .unwrap_or_else(|| {
-                                        app.peers.get(a).map(|p| p.0.as_str()).unwrap_or(a)
-                                    });
-                                let name_b = app
-                                    .custom_names
-                                    .get(b)
-                                    .map(|s| s.as_str())
-                                    .unwrap_or_else(|| {
-                                        app.peers.get(b).map(|p| p.0.as_str()).unwrap_or(b)
-                                    });
+                    if !app.peers.contains_key(&id) {
+                        app.peer_ids.push(id.clone());
+                        let mut peers_to_sort: Vec<String> = app.peer_ids.clone();
+                        peers_to_sort.sort_by(|a, b| {
+                            let name_a = app
+                                .custom_names
+                                .get(a)
+                                .map(|s| s.as_str())
+                                .unwrap_or_else(|| {
+                                    app.peers.get(a).map(|p| p.0.as_str()).unwrap_or(a)
+                                });
+                            let name_b = app
+                                .custom_names
+                                .get(b)
+                                .map(|s| s.as_str())
+                                .unwrap_or_else(|| {
+                                    app.peers.get(b).map(|p| p.0.as_str()).unwrap_or(b)
+                                });
 
-                                name_a.cmp(name_b)
-                            });
-                            app.peer_ids = vec!["__group__".to_string()];
-                            app.peer_ids.extend(peers_to_sort);
-                        }
-
-                        app.peers.insert(id, (name, addr));
+                            name_a.cmp(name_b)
+                        });
+                        app.peer_ids = peers_to_sort;
                     }
+
+                    app.peers.insert(id, (name, addr));
                 }
                 UiEvent::FileProgress {
                     peer_id: _,
@@ -858,44 +858,24 @@ fn render(f: &mut Frame, app: &App) {
         .enumerate()
         .map(|(i, id)| {
             let display_name = app.get_display_name(id);
-            let (style, status) = if id == "__group__" {
-                (
-                    if i == app.selected {
-                        Style::default().fg(Color::Black).bg(Color::Cyan)
-                    } else {
-                        Style::default().fg(Color::Cyan)
-                    },
-                    "".to_string()
-                )
+            let status = if let Some((_, addr)) = app.peers.get(id) {
+                if addr == "Offline" { " [Offline]" } else { " [Connected]" }
             } else {
-                let status = if let Some((_, addr)) = app.peers.get(id) {
-                    if addr == "Offline" { " [Offline]" } else { " [Connected]" }
-                } else {
-                    " [Offline]"
-                };
-                (
-                    if i == app.selected {
-                        Style::default().fg(Color::Black).bg(Color::Yellow)
-                    } else {
-                        Style::default().fg(Color::Yellow)
-                    },
-                    status.to_string()
-                )
+                " [Offline]"
+            };
+            let style = if i == app.selected {
+                Style::default().fg(Color::Black).bg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Yellow)
             };
 
-            if id == "__group__" {
-                ListItem::new(Line::from(vec![
-                    Span::styled(display_name, style),
-                ]))
-            } else {
-                ListItem::new(Line::from(vec![
-                    Span::styled(display_name, style),
-                    Span::styled(status, Style::default().fg(Color::DarkGray)),
-                    Span::raw(" ("),
-                    Span::styled(id, Style::default().fg(Color::DarkGray)),
-                    Span::raw(")"),
-                ]))
-            }
+            ListItem::new(Line::from(vec![
+                Span::styled(display_name, style),
+                Span::styled(status.to_string(), Style::default().fg(Color::DarkGray)),
+                Span::raw(" ("),
+                Span::styled(id, Style::default().fg(Color::DarkGray)),
+                Span::raw(")"),
+            ]))
         })
         .collect();
 
@@ -909,7 +889,7 @@ fn render(f: &mut Frame, app: &App) {
     let active_channel = if !app.peer_ids.is_empty() {
         app.peer_ids[app.selected].clone()
     } else {
-        "__group__".to_string()
+        "System".to_string()
     };
     
     let messages: Vec<ListItem> = app

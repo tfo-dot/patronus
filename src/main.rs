@@ -153,7 +153,8 @@ async fn main() -> Result<()> {
 
     let pd = ProjectDirs::from("com", "patronus", "patronus")
         .expect("No valid user OS profile found");
-    let config_dir = pd.config_dir().to_path_buf();
+    let key_hash = data_encoding::HEXLOWER.encode(Sha256::digest(signing_key.verifying_key().as_bytes()).as_slice());
+    let config_dir = pd.config_dir().join(&key_hash[..16]);
     if !config_dir.exists() {
         fs::create_dir_all(&config_dir).ok();
     }
@@ -173,10 +174,8 @@ async fn main() -> Result<()> {
     // Initialize custom names and peers map
     let mut peer_ids: Vec<String> = loaded_peers.keys().cloned().collect();
     peer_ids.sort();
-    app.peer_ids = vec!["__group__".to_string()];
-    app.peer_ids.extend(peer_ids);
+    app.peer_ids = peer_ids;
 
-    app.peers.insert("__group__".to_string(), ("Lobby (Group Chat)".to_string(), "".to_string()));
     for (id, peer_info) in &loaded_peers {
         if let Some(name) = &peer_info.custom_name {
             app.custom_names.insert(id.clone(), name.clone());
@@ -280,32 +279,18 @@ async fn run_network(
         while let Some(msg) = msg_rx.recv().await {
             match msg {
                 OutboundMessage::Message { target, text, ttl } => {
-                    if target == "__group__" {
-                        let senders: Vec<(String, mpsc::Sender<OutboundMessage>)> = {
-                            let conns = active_conns_clone.lock().unwrap();
-                            conns.iter().map(|(id, s)| (id.clone(), s.clone())).collect()
-                        };
-                        for (peer_id, sender) in senders {
-                            let _ = sender.send(OutboundMessage::Message {
-                                target: peer_id,
-                                text: text.clone(),
-                                ttl,
-                            }).await;
-                        }
+                    let sender = {
+                        let conns = active_conns_clone.lock().unwrap();
+                        conns.get(&target).cloned()
+                    };
+                    if let Some(sender) = sender {
+                        let _ = sender.send(OutboundMessage::Message {
+                            target: target.clone(),
+                            text,
+                            ttl,
+                        }).await;
                     } else {
-                        let sender = {
-                            let conns = active_conns_clone.lock().unwrap();
-                            conns.get(&target).cloned()
-                        };
-                        if let Some(sender) = sender {
-                            let _ = sender.send(OutboundMessage::Message {
-                                target: target.clone(),
-                                text,
-                                ttl,
-                            }).await;
-                        } else {
-                            let _ = ui_tx_clone.send(sys_msg!("Peer {} is not connected.", target)).await;
-                        }
+                        let _ = ui_tx_clone.send(sys_msg!("Peer {} is not connected.", target)).await;
                     }
                 }
                 OutboundMessage::TTLNotice { target, ttl } => {

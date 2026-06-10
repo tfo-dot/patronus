@@ -1006,14 +1006,8 @@ impl PatronusClient {
         S: tokio::io::AsyncWrite + Unpin,
     {
         let (msg_type, json) = match msg {
-            OutboundMessage::Message { target, text, ttl } => {
+            OutboundMessage::Message { target: _, text, ttl } => {
                 let mut base = serde_json::json!({"text": text});
-
-                if target == "__group__" {
-                    if let Some(obj) = base.as_object_mut() {
-                        obj.insert("group".to_string(), "Lobby".into());
-                    }
-                }
 
                 if let Some(val) = ttl {
                     if let Some(obj) = base.as_object_mut() {

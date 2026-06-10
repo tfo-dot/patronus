@@ -133,4 +133,41 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(test_dir);
     }
+
+    #[test]
+    fn test_history_save_load() {
+        let test_dir = std::path::PathBuf::from("target/test_history_save_load");
+        let _ = std::fs::create_dir_all(&test_dir);
+        let key = [0x55u8; 32];
+        let history = vec![
+            StoredMessage {
+                peer_id: "BobNode".to_string(),
+                from: "Me".to_string(),
+                content: "Hello Bob!".to_string(),
+                is_system: false,
+                ttl: Some(3600),
+                timestamp_secs: 123456789,
+            },
+            StoredMessage {
+                peer_id: "BobNode".to_string(),
+                from: "BobNode".to_string(),
+                content: "Hi!".to_string(),
+                is_system: false,
+                ttl: None,
+                timestamp_secs: 123456790,
+            },
+        ];
+
+        save_history(&test_dir, &key, &history).unwrap();
+        let loaded = load_history(&test_dir, &key).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].peer_id, "BobNode");
+        assert_eq!(loaded[0].from, "Me");
+        assert_eq!(loaded[0].content, "Hello Bob!");
+        assert_eq!(loaded[0].ttl, Some(3600));
+        assert_eq!(loaded[1].content, "Hi!");
+        assert_eq!(loaded[1].ttl, None);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
 }
