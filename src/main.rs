@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use ssh_key::{LineEnding, PrivateKey};
 use tokio::sync::mpsc;
 use tokio::time;
+use tokio::io::AsyncReadExt;
 use tui::{App, run_app};
 
 pub use crate::client::{OutboundMessage, UiEvent};
@@ -409,35 +410,79 @@ async fn run_network(
                 client::KEEP_ALIVE_INTERVAL,
             );
 
+            let (mut read_half, mut write_half) = stream.into_split();
+            let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(100);
+
+            tokio::spawn(async move {
+                loop {
+                    // read length (2 bytes)
+                    let mut len_bytes = [0u8; 2];
+                    if read_half.read_exact(&mut len_bytes).await.is_err() {
+                        break;
+                    }
+                    let len = u16::from_be_bytes(len_bytes);
+
+                    // read ratchet_index (4 bytes)
+                    let mut ratchet_bytes = [0u8; 4];
+                    if read_half.read_exact(&mut ratchet_bytes).await.is_err() {
+                        break;
+                    }
+
+                    // read nonce (12 bytes)
+                    let mut nonce = [0u8; 12];
+                    if read_half.read_exact(&mut nonce).await.is_err() {
+                        break;
+                    }
+
+                    // read payload (len bytes)
+                    let mut payload = vec![0u8; len as usize];
+                    if read_half.read_exact(&mut payload).await.is_err() {
+                        break;
+                    }
+
+                    // package into a single Vec<u8>
+                    let mut frame = Vec::with_capacity(2 + 4 + 12 + payload.len());
+                    frame.extend_from_slice(&len_bytes);
+                    frame.extend_from_slice(&ratchet_bytes);
+                    frame.extend_from_slice(&nonce);
+                    frame.extend_from_slice(&payload);
+
+                    if frame_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
             loop {
                 tokio::select! {
                     msg = peer_rx.recv() => {
                         if msg.is_none() {
                             break;
                         }
-                        if client.handle_outbound_msg(&mut stream, msg.unwrap(), &ui_tx_task).await.is_err() {
+                        if client.handle_outbound_msg(&mut write_half, msg.unwrap(), &ui_tx_task).await.is_err() {
                             break;
                         }
                     }
 
-                    readable_res = stream.readable() => {
-                        if readable_res.is_err() {
-                            break;
-                        }
-                        if client.handle_incoming(&mut stream, &ui_tx_task).await.is_err() {
+                    frame_opt = frame_rx.recv() => {
+                        if let Some(frame) = frame_opt {
+                            if client.handle_incoming_frame(&frame, &mut write_half, &ui_tx_task).await.is_err() {
+                                break;
+                            }
+                        } else {
                             break;
                         }
                     }
 
                     _ = keep_alive.tick() => {
-                        if client.tick_keep_alive(&mut stream, &ui_tx_task).await.is_err() {
+                        if client.tick_keep_alive(&mut write_half, &ui_tx_task).await.is_err() {
                             break;
                         }
                     }
                 }
             }
 
-            let _ = client.disconnect(&mut stream).await;
+            let _ = client.disconnect(&mut write_half).await;
 
             {
                 let mut conns = active_conns_task.lock().unwrap();

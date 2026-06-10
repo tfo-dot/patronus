@@ -269,6 +269,7 @@ impl PatronusClient {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn handle_incoming<S>(&mut self, stream: &mut S, ui_tx: &mpsc::Sender<UiEvent>) -> Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -438,14 +439,218 @@ impl PatronusClient {
         Ok(())
     }
 
-    pub async fn handle_outbound_msg<S>(
+    pub async fn handle_incoming_frame<W>(
         &mut self,
-        stream: &mut S,
+        frame_bytes: &[u8],
+        writer: &mut W,
+        ui_tx: &mpsc::Sender<UiEvent>,
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let peer_id = self.peer_node_id.clone().unwrap_or_else(|| "Unknown".to_string());
+
+        if frame_bytes.len() < 18 {
+            return Err(anyhow!("Frame too short"));
+        }
+        let len = u16::from_be_bytes(frame_bytes[0..2].try_into()?);
+        let ratchet_index = u32::from_be_bytes(frame_bytes[2..6].try_into()?);
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&frame_bytes[6..18]);
+        let payload = &frame_bytes[18..];
+
+        if payload.len() != len as usize {
+            return Err(anyhow!("Payload length mismatch"));
+        }
+
+        let is_ratchet = ratchet_index != 0xFFFFFFFF;
+
+        let res = if is_ratchet {
+            let mut combined = Vec::with_capacity(4 + 12 + payload.len());
+            combined.put_u32(ratchet_index);
+            combined.extend_from_slice(&nonce);
+            combined.extend_from_slice(payload);
+            let (msg_type, data) = self.decrypt_message(&combined)?;
+            Ok((msg_type, data, true, ratchet_index))
+        } else {
+            // It's a file chunk or other extension data, the caller must provide the key
+            let mut combined = Vec::with_capacity(12 + payload.len());
+            combined.extend_from_slice(&nonce);
+            combined.extend_from_slice(payload);
+            Ok((0x03, combined, false, 0))
+        };
+
+        match res {
+            Ok((0x01, payload, _, _)) => {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                    let text = json["text"].as_str().ok_or_else(|| anyhow!("Invalid text field"))?;
+                    let ttl = json["ttl"].as_u64();
+                    let group = json["group"].as_str().map(|s| s.to_string());
+
+                    let _ = ui_tx.send(UiEvent::Message {
+                        from: peer_id,
+                        text: text.to_string(),
+                        is_system: false,
+                        ttl,
+                        group,
+                    }).await;
+                }
+            }
+            Ok((0x03, payload, true, _)) => {
+                let json = serde_json::from_slice::<serde_json::Value>(&payload)?;
+
+                if json.get("ttl_notice").is_some() {
+                    let peer_ttl = json["ttl_notice"].as_u64();
+                    let msg = match peer_ttl {
+                        Some(s) => format!("Peer messages will disappear after {}", crate::tui::format_ttl(s)),
+                        None => "Peer disabled message TTL".to_string(),
+                    };
+                    let _ = ui_tx.send(sys_msg(msg)).await;
+                } else if let Some(offer_val) = json.get("file_offer") {
+                    if let Ok(offer) = serde_json::from_value::<FileOffer>(offer_val.clone()) {
+                        self.pending_recv_offer = Some(offer.clone());
+
+                        let _ = ui_tx.send(sys_msg(format!("Received file offer: {} ({} bytes)", offer.file_name, offer.size))).await;
+                        let _ = ui_tx.send(sys_msg("To accept, type: '/accept' or '/accept <path>'")).await;
+                        let _ = ui_tx.send(sys_msg("To decline, type: '/decline'")).await;
+                    }
+                } else if let Some(accept_val) = json.get("file_accept") {
+                    if let Some(_merkle_root) = accept_val.get("merkle_root").and_then(|v| v.as_str()) {
+                        if let Some((path, file_key, file_name)) = self.pending_send_file.take() {
+                            let start_offset = accept_val.get("start_offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let _ = ui_tx.send(sys_msg(format!("Peer accepted. Transmitting file: {file_name} starting at offset {start_offset}..."))).await;
+
+                            match tokio::fs::File::open(&path).await {
+                                Ok(mut file) => {
+                                    let total_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                                    if start_offset > 0 {
+                                        if let Err(e) = file.seek(std::io::SeekFrom::Start(start_offset)).await {
+                                            let _ = ui_tx.send(sys_msg(format!("Failed to seek to offset {start_offset}: {e}"))).await;
+                                            return Ok(());
+                                        }
+                                    }
+
+                                    let mut chunk_buffer = vec![0u8; 16384]; // 16KB chunks
+                                    let mut sent_bytes = 0;
+                                    let mut error_occurred = false;
+
+                                    while let Ok(n) = file.read(&mut chunk_buffer).await {
+                                        if n == 0 { break; }
+
+                                        if let Err(e) = self.send_file_chunk(writer, &file_key, &chunk_buffer[..n]).await {
+                                            let _ = ui_tx.send(sys_msg(format!("Error sending file chunk: {e}"))).await;
+                                            error_occurred = true;
+                                            break;
+                                        }
+
+                                        sent_bytes += n as u64;
+                                        let _ = ui_tx.try_send(UiEvent::FileProgress {
+                                            peer_id: peer_id.clone(),
+                                            file_name: file_name.clone(),
+                                            total_size,
+                                            bytes_transferred: start_offset + sent_bytes,
+                                            is_sending: true,
+                                        });
+                                    }
+
+                                    if !error_occurred {
+                                        let _ = ui_tx.send(sys_msg(format!("Finished sending {file_name} ({} bytes)", start_offset + sent_bytes))).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = ui_tx.send(sys_msg(format!("Failed to open file for sending: {e}"))).await;
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(decline_val) = json.get("file_decline") {
+                    if let Some(_merkle_root) = decline_val.get("merkle_root").and_then(|v| v.as_str()) {
+                        if let Some((_, _, file_name)) = self.pending_send_file.take() {
+                            let _ = ui_tx.send(sys_msg(format!("Peer declined file transfer of: {file_name}"))).await;
+                        }
+                    }
+                }
+            }
+            Ok((0x02, payload, _, _)) => {
+                match payload.first().copied() {
+                    Some(CTRL_PING) => {
+                        self.send_control_frame(writer, CTRL_PONG).await?;
+                    }
+                    Some(CTRL_PONG) => {
+                        self.pending_pong = false;
+                    }
+                    Some(CTRL_BYE) => {
+                        self.send_bye = false;
+                        return Err(anyhow!("Peer disconnected gracefully via CTRL_BYE"));
+                    }
+                    _ => {}
+                }
+            }
+            Ok((0x03, payload, false, _)) => {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&payload) {
+                    if json.get("ttl_notice").is_some() {
+                        let msg = match json["ttl_notice"].as_u64() {
+                            Some(s) => format!("Peer messages will disappear after {}", crate::tui::format_ttl(s)),
+                            None => "Peer disabled message TTL".to_string(),
+                        };
+                        let _ = ui_tx.send(sys_msg(msg)).await;
+                    } else {
+                        let _ = ui_tx.send(sys_msg(format!(
+                            "Got unknown extension packet data: `{}...`",
+                            json.to_string().chars().take(16).collect::<String>()
+                        ))).await;
+                    }
+                } else if let (Some((mut file, name, size)), Some(key)) = (self.receiving_file.take(), self.receiving_key) {
+                    match self.decrypt_file_chunk(&key, &payload) {
+                        Ok((0x03, chunk)) => {
+                            file.write_all(&chunk).await?;
+                            self.receiving_bytes_seen += chunk.len() as u64;
+                            let current_seen = self.receiving_bytes_seen;
+
+                            let _ = ui_tx.try_send(UiEvent::FileProgress {
+                                peer_id: peer_id.clone(),
+                                file_name: name.clone(),
+                                total_size: size,
+                                bytes_transferred: current_seen,
+                                is_sending: false,
+                            });
+
+                            if current_seen >= size {
+                                let _ = ui_tx.send(sys_msg(format!("File transfer complete: {name}"))).await;
+                                self.receiving_file = None;
+                                self.receiving_key = None;
+                            } else {
+                                self.receiving_file = Some((file, name, size));
+                            }
+                        }
+                        _ => {
+                            let _ = ui_tx.send(sys_msg("Failed to decrypt file chunk")).await;
+                            return Err(anyhow!("Failed to decrypt file chunk"));
+                        }
+                    }
+                }
+            }
+            Ok((msg_type, _, _, _)) => {
+                let _ = ui_tx.send(sys_msg(format!("Unknown message type: 0x{msg_type:02x}"))).await;
+                return Err(anyhow!("Unknown message type: 0x{msg_type:02x}"));
+            }
+            Err(e) => {
+                self.send_bye = false;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+
+    pub async fn handle_outbound_msg<W>(
+        &mut self,
+        stream: &mut W,
         msg: OutboundMessage,
         ui_tx: &mpsc::Sender<UiEvent>,
     ) -> Result<()>
     where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
     {
         match msg {
             OutboundMessage::Message { target, text, ttl } => {
@@ -464,16 +669,16 @@ impl PatronusClient {
         }
     }
 
-    pub async fn handle_outbound_command<S>(
+    pub async fn handle_outbound_command<W>(
         &mut self,
-        stream: &mut S,
+        stream: &mut W,
         target: String,
         text: String,
         ttl: Option<u64>,
         ui_tx: &mpsc::Sender<UiEvent>,
     ) -> Result<()>
     where
-        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
     {
         if text.starts_with("/send ") {
             if self.pending_send_file.is_some() {
@@ -833,6 +1038,7 @@ impl PatronusClient {
         Ok((msg_type, payload))
     }
 
+    #[allow(dead_code)]
     pub async fn receive_message<S>(&mut self, stream: &mut S) -> Result<(u8, Vec<u8>, bool, u32)>
     where
         S: tokio::io::AsyncRead + Unpin,
