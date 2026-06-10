@@ -161,11 +161,14 @@ async fn main() -> Result<()> {
 
     let storage_key = storage::derive_storage_key(signing_key.to_bytes().as_ref());
 
+    let app_port: u16 = (rand::random::<u16>() % 255) + 6000;
+
     let mut app = App::new();
     app.selected_interface = selected_interface;
     app.default_interface = get_default_interface();
     app.storage_key = Some(storage_key);
     app.config_dir = Some(config_dir.clone());
+    app.app_port = app_port;
 
     // Load persisted peers and history
     let loaded_peers = storage::load_peers(&config_dir, &storage_key).unwrap_or_default();
@@ -197,8 +200,6 @@ async fn main() -> Result<()> {
     let (ui_tx, ui_rx) = mpsc::channel(100);
     let (msg_tx, msg_rx) = mpsc::channel::<OutboundMessage>(100);
     let (connect_tx, connect_rx) = mpsc::channel::<String>(100);
-
-    let app_port: u16 = (rand::random::<u16>() % 255) + 6000;
 
     let ui_tx_net = ui_tx.clone();
     let signing_key_net = signing_key.clone();

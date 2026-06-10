@@ -6,6 +6,7 @@ use std::{
 
 use crate::discovery::DiscoveryService;
 use anyhow::Result;
+use get_if_addrs::get_if_addrs;
 use tokio::sync::mpsc;
 
 use ratatui::{
@@ -146,6 +147,8 @@ pub fn get_autocomplete_matches(input: &str) -> Vec<String> {
             "/decline".to_string(),
             "/connect ".to_string(),
             "/ttl ".to_string(),
+            "/clear".to_string(),
+            "/whoami".to_string(),
         ];
 
         for rule in AUTOCOMPLETE_RULES {
@@ -263,6 +266,9 @@ pub struct App {
     pub input: String,
     pub rename_input: String,
     pub is_renaming: bool,
+    pub is_showing_help: bool,
+    pub is_showing_whoami: bool,
+    pub app_port: u16,
     pub broadcasting: bool,
     pub autocomplete: Option<AutocompleteState>,
     pub current_ttl: Option<u64>,
@@ -285,6 +291,9 @@ impl App {
             input: String::new(),
             rename_input: String::new(),
             is_renaming: false,
+            is_showing_help: false,
+            is_showing_whoami: false,
+            app_port: 0,
             broadcasting: true,
             autocomplete: None,
             current_ttl: None,
@@ -427,6 +436,23 @@ pub async fn run_app(
                             }
                             _ => {}
                         }
+                    } else if app.is_showing_help {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => {
+                                app.is_showing_help = false;
+                            }
+                            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.is_showing_help = false;
+                            }
+                            _ => {}
+                        }
+                    } else if app.is_showing_whoami {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => {
+                                app.is_showing_whoami = false;
+                            }
+                            _ => {}
+                        }
                     } else {
                         match key.code {
                             KeyCode::Enter => {
@@ -533,6 +559,16 @@ pub async fn run_app(
                                         if !addr.is_empty() {
                                             let _ = connect_tx.try_send(addr);
                                         }
+                                    } else if input == "/clear" {
+                                        let active_channel = if !app.peer_ids.is_empty() {
+                                            app.peer_ids[app.selected].clone()
+                                        } else {
+                                            "System".to_string()
+                                        };
+                                        app.messages.remove(&active_channel);
+                                        app.save_history();
+                                    } else if input == "/whoami" {
+                                        app.is_showing_whoami = true;
                                     } else {
                                         let target = if !app.peer_ids.is_empty() {
                                             Some(app.peer_ids[app.selected].clone())
@@ -649,6 +685,9 @@ pub async fn run_app(
                                             || app.peers.get(peer_id).unwrap().0.clone(),
                                         );
                                 }
+                            }
+                            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.is_showing_help = true;
                             }
                             KeyCode::Char(c) => {
                                 app.input.push(c);
@@ -1030,14 +1069,14 @@ fn render(f: &mut Frame, app: &App) {
         let input = Paragraph::new(app.input.as_str()).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Message (Esc: quit | Ctrl+B: broadcast | Ctrl+R: rename | /connect <ip>:<port> | /send <file> | /accept [<path>] | /decline | /save_dir <path> | /ttl [30s|5m|2h|0]))"),
+                .title("Message (Esc: quit | Ctrl+H: help)"),
         );
         f.render_widget(input, input_layout[1]);
     } else {
         let input = Paragraph::new(app.input.as_str()).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Message (Esc: quit | Ctrl+B: broadcast | Ctrl+R: rename | /connect <ip>:<port> | /send <file> | /accept [<path>] | /decline | /save_dir <path> | /ttl [30s|5m|2h|0]))"),
+                .title("Message (Esc: quit | Ctrl+H: help)"),
         );
         f.render_widget(input, main_layout[3]);
     }
@@ -1051,6 +1090,143 @@ fn render(f: &mut Frame, app: &App) {
         f.render_widget(ratatui::widgets::Clear, area);
         let input = Paragraph::new(app.rename_input.as_str()).block(block);
         f.render_widget(input, area);
+    }
+
+    if app.is_showing_help {
+        let block = Block::default()
+            .title("Help & Shortcuts")
+            .borders(Borders::ALL)
+            .style(Style::default().bg(Color::Blue).fg(Color::White));
+        let area = centered_rect(65, 60, f.area());
+        f.render_widget(ratatui::widgets::Clear, area);
+
+        let help_text = vec![
+            Line::from(vec![
+                Span::styled("Keyboard Shortcuts:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Esc      ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("- Quit application    "),
+                Span::styled("Ctrl + H ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("- Toggle help menu"),
+            ]),
+            Line::from(vec![
+                Span::styled("  Ctrl + R ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("- Rename peer         "),
+                Span::styled("Ctrl + B ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("- Toggle broadcast"),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Commands:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(vec![
+                Span::styled("  /connect <ip>:<port> ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("- Connect to a peer directly"),
+            ]),
+            Line::from(vec![
+                Span::styled("  /send <file>         ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("- Send a file to the active peer"),
+            ]),
+            Line::from(vec![
+                Span::styled("  /accept [<path>]     ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("- Accept incoming file transfer"),
+            ]),
+            Line::from(vec![
+                Span::styled("  /decline             ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("- Decline incoming file transfer"),
+            ]),
+            Line::from(vec![
+                Span::styled("  /save_dir <path>     ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("- Set default save directory"),
+            ]),
+            Line::from(vec![
+                Span::styled("  /ttl [time|0]        ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("- Set Message TTL (e.g. 30s, 5m, 2h, 0 to disable)"),
+            ]),
+            Line::from(vec![
+                Span::styled("  /clear               ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("- Clear active chat history"),
+            ]),
+            Line::from(vec![
+                Span::styled("  /whoami              ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("- Show client port and local IP addresses"),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Press Esc, Enter, Space, or Ctrl+H to close.", Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)),
+            ]),
+        ];
+
+        let paragraph = Paragraph::new(help_text)
+            .block(block)
+            .style(Style::default().bg(Color::Blue).fg(Color::White));
+        f.render_widget(paragraph, area);
+    }
+
+    if app.is_showing_whoami {
+        let block = Block::default()
+            .title("Who Am I (Client Info)")
+            .borders(Borders::ALL)
+            .style(Style::default().bg(Color::Blue).fg(Color::White));
+        let area = centered_rect(60, 40, f.area());
+        f.render_widget(ratatui::widgets::Clear, area);
+
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("Client Port: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw(app.app_port.to_string()),
+            ]),
+            Line::from(""),
+        ];
+
+        if let Some((name, ip)) = &app.selected_interface {
+            lines.push(Line::from(vec![
+                Span::styled("Bound Interface: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw(format!("{} ({})", name, ip)),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("Bound Interface: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("All interfaces (0.0.0.0)"),
+            ]));
+        }
+        lines.push(Line::from(""));
+
+        lines.push(Line::from(vec![
+            Span::styled("Available Connection Addresses:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]));
+
+        let mut found_any = false;
+        if let Some((_, ip)) = &app.selected_interface {
+            lines.push(Line::from(format!("  - {}:{}", ip, app.app_port)));
+            found_any = true;
+        } else if let Ok(interfaces) = get_if_addrs() {
+            for iface in interfaces {
+                if !iface.is_loopback() && iface.addr.ip().is_ipv4() {
+                    lines.push(Line::from(format!("  - {}:{} ({})", iface.addr.ip(), app.app_port, iface.name)));
+                    found_any = true;
+                }
+            }
+        }
+
+        if !found_any {
+            if let Some((_, ip)) = &app.default_interface {
+                lines.push(Line::from(format!("  - {}:{}", ip, app.app_port)));
+            } else {
+                lines.push(Line::from("  - 127.0.0.1 (Loopback only)"));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Press Esc, Enter, or Space to close.", Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)),
+        ]));
+
+        let paragraph = Paragraph::new(lines)
+            .block(block)
+            .style(Style::default().bg(Color::Blue).fg(Color::White));
+        f.render_widget(paragraph, area);
     }
 }
 
