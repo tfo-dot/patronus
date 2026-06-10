@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use get_if_addrs::{get_if_addrs, IfAddr};
 
 use crate::UiEvent;
 
@@ -75,12 +76,15 @@ impl DiscoveryService {
                 .expect("Failed to set broadcast flag");
 
             let payload = format!("{}|{}|{}", magic_header, app_port, node_id);
-            let broadcast_addr = format!("255.255.255.255:{}", DISCOVERY_PORT);
 
             while is_running.load(Ordering::SeqCst) {
                 if broadcasting.load(Ordering::SeqCst) {
-                    if let Err(e) = socket.send_to(payload.as_bytes(), &broadcast_addr) {
-                        eprintln!("Failed to send broadcast: {}", e);
+                    let broadcast_ips = get_broadcast_addresses(bind_ip);
+                    for bcast_ip in broadcast_ips {
+                        let broadcast_addr = format!("{}:{}", bcast_ip, DISCOVERY_PORT);
+                        if let Err(e) = socket.send_to(payload.as_bytes(), &broadcast_addr) {
+                            eprintln!("Failed to send broadcast to {}: {}", broadcast_addr, e);
+                        }
                     }
                 }
 
@@ -156,4 +160,39 @@ impl DiscoveryService {
             }
         })
     }
+}
+
+fn get_broadcast_addresses(bind_ip: std::net::IpAddr) -> Vec<std::net::IpAddr> {
+    let mut addrs = Vec::new();
+    if let Ok(interfaces) = get_if_addrs() {
+        if bind_ip.is_unspecified() {
+            // If binding to all interfaces (0.0.0.0 / ::), find all IPv4 non-loopback interfaces with broadcast addrs
+            for iface in interfaces {
+                if !iface.is_loopback() {
+                    if let IfAddr::V4(ifv4) = iface.addr {
+                        if let Some(bcast) = ifv4.broadcast {
+                            addrs.push(std::net::IpAddr::V4(bcast));
+                        }
+                    }
+                }
+            }
+        } else {
+            // Find the interface that matches bind_ip
+            for iface in interfaces {
+                if iface.addr.ip() == bind_ip {
+                    if let IfAddr::V4(ifv4) = iface.addr {
+                        if let Some(bcast) = ifv4.broadcast {
+                            addrs.push(std::net::IpAddr::V4(bcast));
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    // Fallback to 255.255.255.255 if no broadcast addresses were found
+    if addrs.is_empty() {
+        addrs.push("255.255.255.255".parse().unwrap());
+    }
+    addrs
 }
