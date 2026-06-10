@@ -479,6 +479,18 @@ async fn run_network(
                             break;
                         }
                     }
+
+                    send_res = async {
+                        if client.active_send_file.is_some() {
+                            client.send_active_file_chunk(&mut write_half, &ui_tx_task).await
+                        } else {
+                            std::future::pending::<Result<bool>>().await
+                        }
+                    } => {
+                        if send_res.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
 

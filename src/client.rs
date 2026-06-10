@@ -97,6 +97,7 @@ pub struct PatronusClient {
     pub receiving_key: Option<[u8; 32]>,
     pub receiving_bytes_seen: u64,
     pub pending_send_file: Option<(std::path::PathBuf, [u8; 32], String)>,
+    pub active_send_file: Option<(tokio::fs::File, [u8; 32], u64, u64, String)>,
     pub pending_recv_offer: Option<FileOffer>,
     pub pending_pong: bool,
     pub last_ping: std::time::Instant,
@@ -123,6 +124,7 @@ impl PatronusClient {
             receiving_key: None,
             receiving_bytes_seen: 0,
             pending_send_file: None,
+            active_send_file: None,
             pending_recv_offer: None,
             pending_pong: false,
             last_ping: std::time::Instant::now(),
@@ -529,33 +531,7 @@ impl PatronusClient {
                                             return Ok(());
                                         }
                                     }
-
-                                    let mut chunk_buffer = vec![0u8; 16384]; // 16KB chunks
-                                    let mut sent_bytes = 0;
-                                    let mut error_occurred = false;
-
-                                    while let Ok(n) = file.read(&mut chunk_buffer).await {
-                                        if n == 0 { break; }
-
-                                        if let Err(e) = self.send_file_chunk(writer, &file_key, &chunk_buffer[..n]).await {
-                                            let _ = ui_tx.send(sys_msg(format!("Error sending file chunk: {e}"))).await;
-                                            error_occurred = true;
-                                            break;
-                                        }
-
-                                        sent_bytes += n as u64;
-                                        let _ = ui_tx.try_send(UiEvent::FileProgress {
-                                            peer_id: peer_id.clone(),
-                                            file_name: file_name.clone(),
-                                            total_size,
-                                            bytes_transferred: start_offset + sent_bytes,
-                                            is_sending: true,
-                                        });
-                                    }
-
-                                    if !error_occurred {
-                                        let _ = ui_tx.send(sys_msg(format!("Finished sending {file_name} ({} bytes)", start_offset + sent_bytes))).await;
-                                    }
+                                    self.active_send_file = Some((file, file_key, total_size, start_offset, file_name));
                                 }
                                 Err(e) => {
                                     let _ = ui_tx.send(sys_msg(format!("Failed to open file for sending: {e}"))).await;
@@ -640,6 +616,67 @@ impl PatronusClient {
             }
         }
         Ok(())
+    }
+
+    pub async fn send_active_file_chunk<W>(
+        &mut self,
+        writer: &mut W,
+        ui_tx: &mpsc::Sender<UiEvent>,
+    ) -> Result<bool>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let peer_id = self.peer_node_id.clone().unwrap_or_else(|| "Unknown".to_string());
+        let mut file_done = false;
+        let mut error_occurred = None;
+
+        if let Some((mut file, file_key, total_size, mut sent_bytes, file_name)) = self.active_send_file.take() {
+            let mut chunk_buffer = vec![0u8; 16384]; // 16KB chunks
+            let mut more_chunks = true;
+            match file.read(&mut chunk_buffer).await {
+                Ok(0) => {
+                    file_done = true;
+                    more_chunks = false;
+                }
+                Ok(n) => {
+                    if let Err(e) = self.send_file_chunk(writer, &file_key, &chunk_buffer[..n]).await {
+                        error_occurred = Some(e);
+                        more_chunks = false;
+                    } else {
+                        sent_bytes += n as u64;
+                        let _ = ui_tx.try_send(UiEvent::FileProgress {
+                            peer_id: peer_id.clone(),
+                            file_name: file_name.clone(),
+                            total_size,
+                            bytes_transferred: sent_bytes,
+                            is_sending: true,
+                        });
+                    }
+                }
+                Err(e) => {
+                    error_occurred = Some(e.into());
+                    more_chunks = false;
+                }
+            }
+
+            if more_chunks {
+                self.active_send_file = Some((file, file_key, total_size, sent_bytes, file_name.clone()));
+            }
+
+            if let Some(err) = error_occurred {
+                let _ = ui_tx.send(sys_msg(format!("Error sending file chunk for {file_name}: {err}"))).await;
+                return Err(err);
+            }
+
+            if file_done {
+                let _ = ui_tx.send(sys_msg(format!("Finished sending {file_name} ({total_size} bytes)"))).await;
+                return Ok(false);
+            }
+
+            Ok(more_chunks)
+        } else {
+            Ok(false)
+        }
     }
 
 
