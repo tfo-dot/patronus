@@ -340,13 +340,13 @@ impl PatronusClient {
                                         }
 
                                         sent_bytes += n as u64;
-                                        let _ = ui_tx.send(UiEvent::FileProgress {
+                                        let _ = ui_tx.try_send(UiEvent::FileProgress {
                                             peer_id: peer_id.clone(),
                                             file_name: file_name.clone(),
                                             total_size,
                                             bytes_transferred: start_offset + sent_bytes,
                                             is_sending: true,
-                                        }).await;
+                                        });
                                     }
 
                                     if !error_occurred {
@@ -403,13 +403,13 @@ impl PatronusClient {
                             self.receiving_bytes_seen += chunk.len() as u64;
                             let current_seen = self.receiving_bytes_seen;
 
-                            let _ = ui_tx.send(UiEvent::FileProgress {
+                            let _ = ui_tx.try_send(UiEvent::FileProgress {
                                 peer_id: peer_id.clone(),
                                 file_name: name.clone(),
                                 total_size: size,
                                 bytes_transferred: current_seen,
                                 is_sending: false,
-                            }).await;
+                            });
 
                             if current_seen >= size {
                                 let _ = ui_tx.send(sys_msg(format!("File transfer complete: {name}"))).await;

@@ -420,8 +420,11 @@ async fn run_network(
                         }
                     }
 
-                    res = client.handle_incoming(&mut stream, &ui_tx_task) => {
-                        if res.is_err() {
+                    readable_res = stream.readable() => {
+                        if readable_res.is_err() {
+                            break;
+                        }
+                        if client.handle_incoming(&mut stream, &ui_tx_task).await.is_err() {
                             break;
                         }
                     }

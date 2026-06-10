@@ -771,8 +771,10 @@ pub async fn run_app(
                 }
             }
         }
+        tokio::task::yield_now().await;
     }
 }
+
 
 fn render(f: &mut Frame, app: &App) {
     let show_autocomplete = app
