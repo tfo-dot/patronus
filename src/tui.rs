@@ -250,6 +250,7 @@ pub struct FileTransfer {
     pub bytes_transferred: u64,
     pub is_sending: bool,
     pub start_time: Instant,
+    pub progress_history: Vec<(Instant, u64)>,
 }
 
 pub struct App {
@@ -756,14 +757,23 @@ pub async fn run_app(
                     bytes_transferred,
                     is_sending,
                 } => {
+                    let now = Instant::now();
                     app.active_file_transfers.entry(file_name.clone())
-                        .and_modify(|t| t.bytes_transferred = bytes_transferred)
-                        .or_insert(FileTransfer {
-                            file_name: file_name.clone(),
-                            total_size,
-                            bytes_transferred,
-                            is_sending,
-                            start_time: Instant::now(),
+                        .and_modify(|t| {
+                            t.bytes_transferred = bytes_transferred;
+                            t.progress_history.push((now, bytes_transferred));
+                            let cutoff = now - Duration::from_secs(2);
+                            t.progress_history.retain(|(time, _)| *time >= cutoff);
+                        })
+                        .or_insert_with(|| {
+                            FileTransfer {
+                                file_name: file_name.clone(),
+                                total_size,
+                                bytes_transferred,
+                                is_sending,
+                                start_time: now,
+                                progress_history: vec![(now, bytes_transferred)],
+                            }
                         });
                     if bytes_transferred >= total_size {
                         app.active_file_transfers.remove(&file_name);
@@ -950,7 +960,17 @@ fn render(f: &mut Frame, app: &App) {
 
         let direction = if transfer.is_sending { "Sending" } else { "Receiving" };
         let elapsed = transfer.start_time.elapsed().as_secs_f64();
-        let speed = if elapsed > 0.1 {
+        let speed = if let (Some(&(first_time, first_bytes)), Some(&(last_time, last_bytes))) = (transfer.progress_history.first(), transfer.progress_history.last()) {
+            let dt = last_time.duration_since(first_time).as_secs_f64();
+            if dt > 0.1 {
+                let db = (last_bytes - first_bytes) as f64;
+                db / dt / 1024.0 / 1024.0
+            } else if elapsed > 0.1 {
+                transfer.bytes_transferred as f64 / elapsed / 1024.0 / 1024.0
+            } else {
+                0.0
+            }
+        } else if elapsed > 0.1 {
             transfer.bytes_transferred as f64 / elapsed / 1024.0 / 1024.0
         } else {
             0.0

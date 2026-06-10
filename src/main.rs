@@ -325,14 +325,20 @@ async fn run_network(
         let (mut stream, is_initiator, peer_addr) = tokio::select! {
             incoming = listener.accept() => {
                 match incoming {
-                    Ok((stream, addr)) => (stream, false, addr.to_string()),
+                    Ok((stream, addr)) => {
+                        let _ = stream.set_nodelay(true);
+                        (stream, false, addr.to_string())
+                    }
                     Err(_) => continue,
                 }
             }
             addr = connect_rx.recv() => {
                 if let Some(addr) = addr {
                     match tokio::net::TcpStream::connect(&addr).await {
-                        Ok(stream) => (stream, true, addr),
+                        Ok(stream) => {
+                            let _ = stream.set_nodelay(true);
+                            (stream, true, addr)
+                        }
                         Err(e) => {
                             let _ = ui_tx.send(sys_msg!("Connection to {addr} failed: {e}")).await;
                             continue;
@@ -415,12 +421,12 @@ async fn run_network(
 
             tokio::spawn(async move {
                 loop {
-                    // read length (2 bytes)
-                    let mut len_bytes = [0u8; 2];
+                    // read length (4 bytes)
+                    let mut len_bytes = [0u8; 4];
                     if read_half.read_exact(&mut len_bytes).await.is_err() {
                         break;
                     }
-                    let len = u16::from_be_bytes(len_bytes);
+                    let len = u32::from_be_bytes(len_bytes);
 
                     // read ratchet_index (4 bytes)
                     let mut ratchet_bytes = [0u8; 4];
@@ -441,7 +447,7 @@ async fn run_network(
                     }
 
                     // package into a single Vec<u8>
-                    let mut frame = Vec::with_capacity(2 + 4 + 12 + payload.len());
+                    let mut frame = Vec::with_capacity(4 + 4 + 12 + payload.len());
                     frame.extend_from_slice(&len_bytes);
                     frame.extend_from_slice(&ratchet_bytes);
                     frame.extend_from_slice(&nonce);

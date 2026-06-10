@@ -93,15 +93,17 @@ pub struct PatronusClient {
 
     // Session / Connection State fields
     pub save_dir: std::path::PathBuf,
-    pub receiving_file: Option<(tokio::fs::File, String, u64)>,
+    pub receiving_file: Option<(tokio::io::BufWriter<tokio::fs::File>, String, u64)>,
     pub receiving_key: Option<[u8; 32]>,
     pub receiving_bytes_seen: u64,
-    pub pending_send_file: Option<(std::path::PathBuf, [u8; 32], String)>,
-    pub active_send_file: Option<(tokio::fs::File, [u8; 32], u64, u64, String)>,
+    pub pending_send_file: Option<(std::path::PathBuf, [u8; 32], String, u32, u64)>,
+    pub active_send_file: Option<(tokio::io::BufReader<tokio::fs::File>, [u8; 32], u64, u64, String, u32, u64)>,
     pub pending_recv_offer: Option<FileOffer>,
     pub pending_pong: bool,
     pub last_ping: std::time::Instant,
     pub send_bye: bool,
+    pub send_buffer: Vec<u8>,
+    pub plaintext_buffer: Vec<u8>,
 }
 
 impl PatronusClient {
@@ -129,6 +131,8 @@ impl PatronusClient {
             pending_pong: false,
             last_ping: std::time::Instant::now(),
             send_bye: true,
+            send_buffer: Vec::new(),
+            plaintext_buffer: Vec::new(),
         }
     }
 
@@ -315,13 +319,14 @@ impl PatronusClient {
                     }
                 } else if let Some(accept_val) = json.get("file_accept") {
                     if let Some(_merkle_root) = accept_val.get("merkle_root").and_then(|v| v.as_str()) {
-                        if let Some((path, file_key, file_name)) = self.pending_send_file.take() {
+                        if let Some((path, file_key, file_name, chunk_size, delay_ms)) = self.pending_send_file.take() {
                             let start_offset = accept_val.get("start_offset").and_then(|v| v.as_u64()).unwrap_or(0);
                             let _ = ui_tx.send(sys_msg(format!("Peer accepted. Transmitting file: {file_name} starting at offset {start_offset}..."))).await;
 
                             match tokio::fs::File::open(&path).await {
-                                Ok(mut file) => {
-                                    let total_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                                Ok(file) => {
+                                    let mut file = tokio::io::BufReader::new(file);
+                                    let total_size = file.get_ref().metadata().await.map(|m| m.len()).unwrap_or(0);
                                     if start_offset > 0 {
                                         if let Err(e) = file.seek(std::io::SeekFrom::Start(start_offset)).await {
                                             let _ = ui_tx.send(sys_msg(format!("Failed to seek to offset {start_offset}: {e}"))).await;
@@ -329,12 +334,16 @@ impl PatronusClient {
                                         }
                                     }
 
-                                    let mut chunk_buffer = vec![0u8; 16384]; // 16KB chunks
+                                    let mut chunk_buffer = vec![0u8; chunk_size as usize];
                                     let mut sent_bytes = 0;
                                     let mut error_occurred = false;
 
                                     while let Ok(n) = file.read(&mut chunk_buffer).await {
                                         if n == 0 { break; }
+
+                                        if delay_ms > 0 {
+                                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                                        }
 
                                         if let Err(e) = self.send_file_chunk(stream, &file_key, &chunk_buffer[..n]).await {
                                             let _ = ui_tx.send(sys_msg(format!("Error sending file chunk: {e}"))).await;
@@ -364,7 +373,7 @@ impl PatronusClient {
                     }
                 } else if let Some(decline_val) = json.get("file_decline") {
                     if let Some(_merkle_root) = decline_val.get("merkle_root").and_then(|v| v.as_str()) {
-                        if let Some((_, _, file_name)) = self.pending_send_file.take() {
+                        if let Some((_, _, file_name, _, _)) = self.pending_send_file.take() {
                             let _ = ui_tx.send(sys_msg(format!("Peer declined file transfer of: {file_name}"))).await;
                         }
                     }
@@ -401,8 +410,9 @@ impl PatronusClient {
                     }
                 } else if let (Some((mut file, name, size)), Some(key)) = (self.receiving_file.take(), self.receiving_key) {
                     match self.decrypt_file_chunk(&key, &payload) {
-                        Ok((0x03, chunk)) => {
-                            file.write_all(&chunk).await?;
+                        Ok(decrypted) if !decrypted.is_empty() && decrypted[0] == 0x03 => {
+                            let chunk = &decrypted[1..];
+                            file.write_all(chunk).await?;
                             self.receiving_bytes_seen += chunk.len() as u64;
                             let current_seen = self.receiving_bytes_seen;
 
@@ -415,6 +425,7 @@ impl PatronusClient {
                             });
 
                             if current_seen >= size {
+                                file.flush().await?; // Flush BufWriter
                                 let _ = ui_tx.send(sys_msg(format!("File transfer complete: {name}"))).await;
                                 self.receiving_file = None;
                                 self.receiving_key = None;
@@ -452,14 +463,14 @@ impl PatronusClient {
     {
         let peer_id = self.peer_node_id.clone().unwrap_or_else(|| "Unknown".to_string());
 
-        if frame_bytes.len() < 18 {
+        if frame_bytes.len() < 20 {
             return Err(anyhow!("Frame too short"));
         }
-        let len = u16::from_be_bytes(frame_bytes[0..2].try_into()?);
-        let ratchet_index = u32::from_be_bytes(frame_bytes[2..6].try_into()?);
+        let len = u32::from_be_bytes(frame_bytes[0..4].try_into()?);
+        let ratchet_index = u32::from_be_bytes(frame_bytes[4..8].try_into()?);
         let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&frame_bytes[6..18]);
-        let payload = &frame_bytes[18..];
+        nonce.copy_from_slice(&frame_bytes[8..20]);
+        let payload = &frame_bytes[20..];
 
         if payload.len() != len as usize {
             return Err(anyhow!("Payload length mismatch"));
@@ -518,20 +529,21 @@ impl PatronusClient {
                     }
                 } else if let Some(accept_val) = json.get("file_accept") {
                     if let Some(_merkle_root) = accept_val.get("merkle_root").and_then(|v| v.as_str()) {
-                        if let Some((path, file_key, file_name)) = self.pending_send_file.take() {
+                        if let Some((path, file_key, file_name, chunk_size, delay_ms)) = self.pending_send_file.take() {
                             let start_offset = accept_val.get("start_offset").and_then(|v| v.as_u64()).unwrap_or(0);
                             let _ = ui_tx.send(sys_msg(format!("Peer accepted. Transmitting file: {file_name} starting at offset {start_offset}..."))).await;
 
                             match tokio::fs::File::open(&path).await {
-                                Ok(mut file) => {
-                                    let total_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+                                Ok(file) => {
+                                    let mut file = tokio::io::BufReader::new(file);
+                                    let total_size = file.get_ref().metadata().await.map(|m| m.len()).unwrap_or(0);
                                     if start_offset > 0 {
                                         if let Err(e) = file.seek(std::io::SeekFrom::Start(start_offset)).await {
                                             let _ = ui_tx.send(sys_msg(format!("Failed to seek to offset {start_offset}: {e}"))).await;
                                             return Ok(());
                                         }
                                     }
-                                    self.active_send_file = Some((file, file_key, total_size, start_offset, file_name));
+                                    self.active_send_file = Some((file, file_key, total_size, start_offset, file_name, chunk_size, delay_ms));
                                 }
                                 Err(e) => {
                                     let _ = ui_tx.send(sys_msg(format!("Failed to open file for sending: {e}"))).await;
@@ -541,7 +553,7 @@ impl PatronusClient {
                     }
                 } else if let Some(decline_val) = json.get("file_decline") {
                     if let Some(_merkle_root) = decline_val.get("merkle_root").and_then(|v| v.as_str()) {
-                        if let Some((_, _, file_name)) = self.pending_send_file.take() {
+                        if let Some((_, _, file_name, _, _)) = self.pending_send_file.take() {
                             let _ = ui_tx.send(sys_msg(format!("Peer declined file transfer of: {file_name}"))).await;
                         }
                     }
@@ -578,8 +590,9 @@ impl PatronusClient {
                     }
                 } else if let (Some((mut file, name, size)), Some(key)) = (self.receiving_file.take(), self.receiving_key) {
                     match self.decrypt_file_chunk(&key, &payload) {
-                        Ok((0x03, chunk)) => {
-                            file.write_all(&chunk).await?;
+                        Ok(decrypted) if !decrypted.is_empty() && decrypted[0] == 0x03 => {
+                            let chunk = &decrypted[1..];
+                            file.write_all(chunk).await?;
                             self.receiving_bytes_seen += chunk.len() as u64;
                             let current_seen = self.receiving_bytes_seen;
 
@@ -592,6 +605,7 @@ impl PatronusClient {
                             });
 
                             if current_seen >= size {
+                                file.flush().await?; // Flush BufWriter
                                 let _ = ui_tx.send(sys_msg(format!("File transfer complete: {name}"))).await;
                                 self.receiving_file = None;
                                 self.receiving_key = None;
@@ -630,18 +644,47 @@ impl PatronusClient {
         let mut file_done = false;
         let mut error_occurred = None;
 
-        if let Some((mut file, file_key, total_size, mut sent_bytes, file_name)) = self.active_send_file.take() {
-            let mut chunk_buffer = vec![0u8; 16384]; // 16KB chunks
+        if self.active_send_file.is_some() {
+            let state = self.active_send_file.take();
+            let mut guard = ActiveSendFileGuard {
+                client: self,
+                state,
+            };
+
+            let chunk_size = guard.state.as_ref().unwrap().5;
+            let delay_ms = guard.state.as_ref().unwrap().6;
+
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+
+            if guard.client.send_buffer.len() != chunk_size as usize {
+                guard.client.send_buffer.resize(chunk_size as usize, 0);
+            }
             let mut more_chunks = true;
-            match file.read(&mut chunk_buffer).await {
+
+            let read_result = {
+                let file = &mut guard.state.as_mut().unwrap().0;
+                file.read(&mut guard.client.send_buffer).await
+            };
+
+            match read_result {
                 Ok(0) => {
                     file_done = true;
                     more_chunks = false;
                 }
                 Ok(n) => {
-                    if let Err(e) = self.send_file_chunk(writer, &file_key, &chunk_buffer[..n]).await {
+                    let state = guard.state.take().unwrap();
+                    let (file, file_key, total_size, mut sent_bytes, file_name, chunk_size, delay_ms) = state;
+
+                    let buffer = std::mem::take(&mut guard.client.send_buffer);
+                    let res = guard.client.send_file_chunk(writer, &file_key, &buffer[..n]).await;
+                    guard.client.send_buffer = buffer;
+
+                    if let Err(e) = res {
                         error_occurred = Some(e);
                         more_chunks = false;
+                        guard.state = Some((file, file_key, total_size, sent_bytes, file_name, chunk_size, delay_ms));
                     } else {
                         sent_bytes += n as u64;
                         let _ = ui_tx.try_send(UiEvent::FileProgress {
@@ -651,6 +694,7 @@ impl PatronusClient {
                             bytes_transferred: sent_bytes,
                             is_sending: true,
                         });
+                        guard.state = Some((file, file_key, total_size, sent_bytes, file_name, chunk_size, delay_ms));
                     }
                 }
                 Err(e) => {
@@ -659,20 +703,23 @@ impl PatronusClient {
                 }
             }
 
-            if more_chunks {
-                self.active_send_file = Some((file, file_key, total_size, sent_bytes, file_name.clone()));
-            }
+            let state = guard.state.take().unwrap();
+            drop(guard);
+            let (file, file_key, total_size, sent_bytes, file_name, chunk_size, delay_ms) = state;
 
             if let Some(err) = error_occurred {
+                self.active_send_file = None;
                 let _ = ui_tx.send(sys_msg(format!("Error sending file chunk for {file_name}: {err}"))).await;
                 return Err(err);
             }
 
             if file_done {
+                self.active_send_file = None;
                 let _ = ui_tx.send(sys_msg(format!("Finished sending {file_name} ({total_size} bytes)"))).await;
                 return Ok(false);
             }
 
+            self.active_send_file = Some((file, file_key, total_size, sent_bytes, file_name, chunk_size, delay_ms));
             Ok(more_chunks)
         } else {
             Ok(false)
@@ -726,10 +773,41 @@ impl PatronusClient {
             }
 
             let path_str = text.strip_prefix("/send ").unwrap().trim();
-            let path = std::path::Path::new(path_str);
+            
+            let mut chunk_size = 1024 * 1024; // 1MB default
+            let mut delay_ms = 0u64;
+            let mut path_to_send = path_str.to_string();
+
+            let mut parsed_ok = false;
+            let parts: Vec<&str> = path_str.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let last = parts[parts.len() - 1];
+                let second_last = parts[parts.len() - 2];
+                if let (Ok(kb), Ok(ms)) = (second_last.parse::<u32>(), last.parse::<u64>()) {
+                    let temp_path = parts[..parts.len() - 2].join(" ");
+                    if std::path::Path::new(&temp_path).exists() {
+                        chunk_size = kb * 1024;
+                        delay_ms = ms;
+                        path_to_send = temp_path;
+                        parsed_ok = true;
+                    }
+                }
+            }
+            if !parsed_ok && parts.len() >= 2 {
+                let last = parts[parts.len() - 1];
+                if let Ok(kb) = last.parse::<u32>() {
+                    let temp_path = parts[..parts.len() - 1].join(" ");
+                    if std::path::Path::new(&temp_path).exists() {
+                        chunk_size = kb * 1024;
+                        path_to_send = temp_path;
+                    }
+                }
+            }
+
+            let path = std::path::Path::new(&path_to_send);
 
             if !path.exists() {
-                let _ = ui_tx.send(sys_msg(format!("File not found: {path_str}"))).await;
+                let _ = ui_tx.send(sys_msg(format!("File not found: {path_to_send}"))).await;
                 return Ok(());
             }
 
@@ -759,7 +837,8 @@ impl PatronusClient {
             }
 
             let _ = ui_tx.send(sys_msg(format!(
-                "Offered file: {file_name} ({size} bytes). Waiting for peer to accept/decline..."
+                "Offered file: {file_name} ({size} bytes). Chunk size: {}KB, delay: {}ms. Waiting for peer...",
+                chunk_size / 1024, delay_ms
             ))).await;
 
             let file_key = self
@@ -767,7 +846,7 @@ impl PatronusClient {
                 .derive_file_key(merkle_root.as_bytes())
                 .map_err(|e| anyhow!(e))?;
 
-            self.pending_send_file = Some((path.to_path_buf(), file_key, file_name));
+            self.pending_send_file = Some((path.to_path_buf(), file_key, file_name, chunk_size, delay_ms));
             return Ok(());
         }
 
@@ -871,7 +950,7 @@ impl PatronusClient {
                         "Accepted file offer. Saving to: {display_path}. Waiting for peer to transmit..."
                     ))).await;
 
-                    self.receiving_file = Some((file, offer.file_name.clone(), offer.size));
+                    self.receiving_file = Some((tokio::io::BufWriter::new(file), offer.file_name.clone(), offer.size));
                     self.receiving_key = Some(key);
                     self.receiving_bytes_seen = start_offset;
 
@@ -1019,29 +1098,23 @@ impl PatronusClient {
         S: tokio::io::AsyncWrite + Unpin,
     {
         // 0x03: Extension Data
-        let mut plaintext = Vec::with_capacity(1 + chunk.len());
-        plaintext.push(0x03);
-        plaintext.extend_from_slice(chunk);
+        self.plaintext_buffer.clear();
+        self.plaintext_buffer.reserve(1 + chunk.len());
+        self.plaintext_buffer.push(0x03);
+        self.plaintext_buffer.extend_from_slice(chunk);
 
-        // Compression (optional for binary data, but protocol says we MUST use agreed alg)
-        let compressed = match self.selected_compression.as_deref() {
-            Some("compression:zstd") => zstd::encode_all(Cursor::new(plaintext), 3)?,
-            _ => plaintext,
-        };
+        // Compression is disabled for file chunks to improve transfer speed (CPU bottleneck)
+        let compressed = &self.plaintext_buffer;
 
         // Encrypt with file-specific key (NO RATCHET)
-        let encrypted = self.crypto.encrypt_with_key(key, &compressed);
+        let encrypted = self.crypto.encrypt_with_key(key, compressed);
 
-        // Frame: 2-byte length + 4-byte 0xFFFFFFFF (sentinel for no ratchet) + 12-byte nonce + payload
+        // Frame: 4-byte length + 4-byte 0xFFFFFFFF (sentinel for no ratchet) + 12-byte nonce + payload
         let nonce = &encrypted[..12];
         let ciphertext_and_tag = &encrypted[12..];
 
-        if u16::try_from(ciphertext_and_tag.len()).is_err() {
-            return Err(anyhow!("Ciphertext and tag length overflows u16"));
-        }
-
-        let mut frame = Vec::with_capacity(2 + 4 + 12 + ciphertext_and_tag.len());
-        frame.put_u16(ciphertext_and_tag.len() as u16);
+        let mut frame = Vec::with_capacity(4 + 4 + 12 + ciphertext_and_tag.len());
+        frame.put_u32(ciphertext_and_tag.len() as u32);
         frame.put_u32(0xFFFFFFFF); // Sentinel for "Not a Ratchet Message"
         frame.extend_from_slice(nonce);
         frame.extend_from_slice(ciphertext_and_tag);
@@ -1050,29 +1123,18 @@ impl PatronusClient {
         Ok(())
     }
 
-    pub fn decrypt_file_chunk(&mut self, key: &[u8; 32], frame: &[u8]) -> Result<(u8, Vec<u8>)> {
+    pub fn decrypt_file_chunk(&mut self, key: &[u8; 32], frame: &[u8]) -> Result<Vec<u8>> {
         // frame contains: nonce(12) + ciphertext+tag
         let decrypted = self
             .crypto
             .decrypt_with_key(key, frame)
             .map_err(|e| anyhow!(e))?;
 
-        let mut decompressed = Vec::new();
-        match self.selected_compression.as_deref() {
-            Some("compression:zstd") => {
-                zstd::Decoder::new(Cursor::new(decrypted))?.read_to_end(&mut decompressed)?;
-            }
-            _ => decompressed = decrypted,
+        if decrypted.is_empty() {
+            return Err(anyhow!("Empty payload after decryption"));
         }
 
-        if decompressed.is_empty() {
-            return Err(anyhow!("Empty payload after decompression"));
-        }
-
-        let msg_type = decompressed[0];
-        let payload = decompressed[1..].to_vec();
-
-        Ok((msg_type, payload))
+        Ok(decrypted)
     }
 
     #[allow(dead_code)]
@@ -1080,7 +1142,7 @@ impl PatronusClient {
     where
         S: tokio::io::AsyncRead + Unpin,
     {
-        let len = stream.read_u16().await?;
+        let len = stream.read_u32().await?;
         let ratchet_index = stream.read_u32().await?;
         let mut nonce = [0u8; 12];
         stream.read_exact(&mut nonce).await?;
@@ -1122,7 +1184,7 @@ impl PatronusClient {
 
         // encrypted contains: nonce(12) + ciphertext(len) + tag(16)
         // New Frame format:
-        // 1. Frame Length: 2 bytes (Ciphertext + Tag)
+        // 1. Frame Length: 4 bytes (Ciphertext + Tag)
         // 2. Ratchet Index: 4 bytes
         // 3. Nonce: 12 bytes
         // 4. Ciphertext + Auth Tag
@@ -1130,14 +1192,8 @@ impl PatronusClient {
         let nonce = &encrypted[..12];
         let ciphertext_and_tag = &encrypted[12..];
 
-        if ciphertext_and_tag.len() > u16::MAX as usize {
-            return Err(anyhow!(
-                "Message too large to frame (max {} bytes)",
-                u16::MAX
-            ));
-        }
-        let mut frame = Vec::with_capacity(2 + 4 + 12 + ciphertext_and_tag.len());
-        frame.put_u16(ciphertext_and_tag.len() as u16);
+        let mut frame = Vec::with_capacity(4 + 4 + 12 + ciphertext_and_tag.len());
+        frame.put_u32(ciphertext_and_tag.len() as u32);
         frame.put_u32(ratchet_index);
         frame.extend_from_slice(nonce);
         frame.extend_from_slice(ciphertext_and_tag);
@@ -1185,5 +1241,18 @@ impl PatronusClient {
         let payload = decompressed[1..].to_vec();
 
         Ok((msg_type, payload))
+    }
+}
+
+struct ActiveSendFileGuard<'a> {
+    client: &'a mut PatronusClient,
+    state: Option<(tokio::io::BufReader<tokio::fs::File>, [u8; 32], u64, u64, String, u32, u64)>,
+}
+
+impl<'a> Drop for ActiveSendFileGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            self.client.active_send_file = Some(state);
+        }
     }
 }
